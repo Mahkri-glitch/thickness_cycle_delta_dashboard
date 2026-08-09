@@ -50,14 +50,33 @@ def prepare_numeric_data(df: pd.DataFrame, time_col: str, thickness_col: str) ->
     return cleaned.dropna().reset_index(drop=True)
 
 
-def plot_full_dataset(df: pd.DataFrame, time_col: str, thickness_col: str) -> None:
-    """Render a lightweight overview; no calculations use downsampled data."""
+def plot_full_dataset(
+    df: pd.DataFrame,
+    time_col: str,
+    thickness_col: str,
+    start_time: float,
+    end_time: float,
+) -> None:
+    """Render a lightweight overview with the selected analysis-window boundaries."""
     x = df[time_col].to_numpy(dtype=float)
     y = df[thickness_col].to_numpy(dtype=float)
     plot_x, plot_y = downsample_for_plot(x, y, max_points=5000)
 
     fig, ax = plt.subplots(figsize=(16, 5))
     ax.plot(plot_x, plot_y, linewidth=2, alpha=0.7)
+
+    # Show the current analysis-window boundaries on the full trace.
+    ax.axvline(
+        x=start_time,
+        linestyle="--",
+        linewidth=2,
+    )
+    ax.axvline(
+        x=end_time,
+        linestyle="--",
+        linewidth=2,
+    )
+
     ax.set_xlabel(time_col)
     ax.set_ylabel(thickness_col)
     st.pyplot(fig)
@@ -279,8 +298,18 @@ analysis_df = full_df.iloc[window_start : window_end + 1].reset_index(drop=True)
 time_values = analysis_df[time_col].to_numpy(dtype=float)
 thickness_values = analysis_df[thickness_col].to_numpy(dtype=float)
 
+# Use the selected endpoints to mark the active analysis window on the overview.
+start_time = float(full_df.iloc[window_start][time_col])
+end_time = float(full_df.iloc[window_end][time_col])
+
 st.subheader("Select Analysis Window")
-plot_full_dataset(full_df, time_col, thickness_col)
+plot_full_dataset(
+    full_df,
+    time_col,
+    thickness_col,
+    start_time=start_time,
+    end_time=end_time,
+)
 
 max_allowed_order = max(1, min(250, (len(full_df) - 1) // 2))
 default_order = min(10, max_allowed_order)
@@ -438,11 +467,7 @@ else:
         "Adjust the analysis window and/or extrema filter order."
     )
 
-st.subheader(
-    "Δ1 and Δ2 by cycle"
-    if analysis_type == "2-step"
-    else "Δ1, Δ2, and Δ3 by cycle"
-)
+st.subheader("Δ1 and Δ2 by cycle" if analysis_type == "2-step" else "Δ1, Δ2, and Δ3 by cycle")
 
 if cycle_df.empty:
     st.write("No complete cycles are available in the selected analysis window.")
