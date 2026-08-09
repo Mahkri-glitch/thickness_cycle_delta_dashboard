@@ -5,10 +5,6 @@ from __future__ import annotations
 import io
 import warnings
 
-import matplotlib
-
-# Force a non-interactive backend for reliable headless rendering on Vercel.
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -54,27 +50,6 @@ def prepare_numeric_data(df: pd.DataFrame, time_col: str, thickness_col: str) ->
     return cleaned.dropna().reset_index(drop=True)
 
 
-def render_figure(fig: plt.Figure) -> None:
-    """Render a Matplotlib figure as an independent PNG and then free it.
-
-    Converting each figure to its own image buffer avoids shared Matplotlib figure
-    state across Streamlit reruns, which is especially useful on headless hosts.
-    """
-    buffer = io.BytesIO()
-    try:
-        fig.tight_layout()
-        fig.savefig(
-            buffer,
-            format="png",
-            dpi=110,
-            bbox_inches="tight",
-        )
-        st.image(buffer.getvalue(), use_container_width=True)
-    finally:
-        buffer.close()
-        plt.close(fig)
-
-
 def plot_full_dataset(
     df: pd.DataFrame,
     time_col: str,
@@ -104,7 +79,8 @@ def plot_full_dataset(
 
     ax.set_xlabel(time_col)
     ax.set_ylabel(thickness_col)
-    render_figure(fig)
+    st.pyplot(fig)
+    plt.close(fig)
 
 
 def plot_cycle_analysis(
@@ -204,7 +180,8 @@ def plot_cycle_analysis(
     ax.set_xlabel(time_col)
     ax.set_ylabel(thickness_col)
     ax.legend()
-    render_figure(fig)
+    st.pyplot(fig)
+    plt.close(fig)
 
 
 def show_interpretation_guide() -> None:
@@ -325,15 +302,14 @@ thickness_values = analysis_df[thickness_col].to_numpy(dtype=float)
 start_time = float(full_df.iloc[window_start][time_col])
 end_time = float(full_df.iloc[window_end][time_col])
 
-with st.container():
-    st.subheader("Select Analysis Window")
-    plot_full_dataset(
-        full_df,
-        time_col,
-        thickness_col,
-        start_time=start_time,
-        end_time=end_time,
-    )
+st.subheader("Select Analysis Window")
+plot_full_dataset(
+    full_df,
+    time_col,
+    thickness_col,
+    start_time=start_time,
+    end_time=end_time,
+)
 
 max_allowed_order = max(1, min(250, (len(full_df) - 1) // 2))
 default_order = min(10, max_allowed_order)
@@ -447,22 +423,21 @@ result = calculate_cycles(
 )
 cycle_df = result.cycle_df
 
-with st.container():
-    st.subheader(f"{analysis_type} Cycle Detection")
-    plot_cycle_analysis(
-        time_values=time_values,
-        thickness_values=thickness_values,
-        min_indices=min_indices,
-        max_indices=max_indices,
-        recovered_min_indices=recovered_min_indices,
-        recovered_max_indices=recovered_max_indices,
-        transition_indices=result.transition_indices,
-        recovered_transition_indices=result.recovered_transition_indices,
-        analysis_type=analysis_type,
-        time_col=time_col,
-        thickness_col=thickness_col,
-        selected_issue=selected_issue,
-    )
+st.subheader(f"{analysis_type} Cycle Detection")
+plot_cycle_analysis(
+    time_values=time_values,
+    thickness_values=thickness_values,
+    min_indices=min_indices,
+    max_indices=max_indices,
+    recovered_min_indices=recovered_min_indices,
+    recovered_max_indices=recovered_max_indices,
+    transition_indices=result.transition_indices,
+    recovered_transition_indices=result.recovered_transition_indices,
+    analysis_type=analysis_type,
+    time_col=time_col,
+    thickness_col=thickness_col,
+    selected_issue=selected_issue,
+)
 
 # -----------------------------------------------------------------------------
 # Diagnostics and results
