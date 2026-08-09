@@ -245,11 +245,3 @@ Then run:
 ```bash
 pytest -q
 ```
-
-## Important interpretation notes
-
-- The program detects signal features; it does not independently prove their physical origin.
-- Do not use `abs()` to force deltas positive. A negative delta can be useful evidence that a detected point does not match the expected physical ordering.
-- Analysis-window boundaries can suppress extrema because relative-extrema detection requires neighboring context. Include enough data before the first desired minimum and after the final desired minimum.
-- Programmed process-cycle count, detected extrema count, and calculable cycle count do not have to be identical.
-- Point C should be treated as a derivative-based operational definition and visually verified against the expected process behavior.
