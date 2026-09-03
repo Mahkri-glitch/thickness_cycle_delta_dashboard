@@ -1,8 +1,4 @@
-"""Core analysis functions for the Thickness Cycle Delta Analyzer.
-
-The functions in this module are intentionally independent of Streamlit so they
-can be tested, reused, and reasoned about separately from the user interface.
-"""
+"""Core analysis functions for the Thickness Cycle Delta Analyzer."""
 
 from __future__ import annotations
 
@@ -34,8 +30,6 @@ OUTPUT_COLUMNS = [
 
 @dataclass
 class RecoveryResult:
-    """Updated extrema arrays plus any point newly recovered in one local gap."""
-
     min_indices: np.ndarray
     max_indices: np.ndarray
     recovered_min_indices: list[int]
@@ -44,8 +38,6 @@ class RecoveryResult:
 
 @dataclass
 class CycleAnalysisResult:
-    """Cycle-level output and diagnostic metadata."""
-
     cycle_df: pd.DataFrame
     transition_indices: list[int]
     recovered_transition_indices: list[int]
@@ -79,7 +71,6 @@ def build_events(
             "Thickness": thickness_values[min_indices],
         }
     )
-
     max_events = pd.DataFrame(
         {
             "Index": max_indices,
@@ -88,7 +79,6 @@ def build_events(
             "Thickness": thickness_values[max_indices],
         }
     )
-
     return (
         pd.concat([min_events, max_events], ignore_index=True)
         .sort_values("Index")
@@ -97,11 +87,7 @@ def build_events(
 
 
 def find_suspect_regions(events: pd.DataFrame) -> list[dict]:
-    """Find broken alternation that suggests one missing opposite extremum.
-
-    MAX -> MAX suggests a missing minimum between the two maxima.
-    MIN -> MIN suggests a missing maximum between the two minima.
-    """
+    """Find broken MIN/MAX alternation suggesting one missing opposite extremum."""
     records = events.to_dict("records")
     suspects: list[dict] = []
 
@@ -122,7 +108,6 @@ def find_suspect_regions(events: pd.DataFrame) -> list[dict]:
                 "End Time": float(second["Time"]),
             }
         )
-
     return suspects
 
 
@@ -133,11 +118,7 @@ def recover_missing_extremum(
     issue: dict,
     recovery_order: int,
 ) -> RecoveryResult:
-    """Recover one missing extremum inside a suspicious gap.
-
-    Recovery is additive: existing global extrema are preserved. The local
-    search only adds one candidate inside the selected same-type gap.
-    """
+    """Recover one missing extremum inside a suspicious same-type gap."""
     updated_mins = np.asarray(min_indices, dtype=int).copy()
     updated_maxs = np.asarray(max_indices, dtype=int).copy()
     recovered_mins: list[int] = []
@@ -152,7 +133,6 @@ def recover_missing_extremum(
     padded_end = min(len(thickness_values) - 1, region_end + padding)
     local_thickness = thickness_values[padded_start : padded_end + 1]
 
-    # Guard against an order that is much larger than the local search region.
     local_max_order = max(1, (len(local_thickness) - 1) // 2)
     effective_order = min(recovery_order, local_max_order)
 
@@ -160,17 +140,14 @@ def recover_missing_extremum(
         candidates = signal.argrelmin(local_thickness, order=effective_order)[0]
         candidates = candidates + padded_start
         candidates = candidates[(candidates > region_start) & (candidates < region_end)]
-
         if len(candidates) > 0:
             recovered_idx = int(candidates[np.argmin(thickness_values[candidates])])
             updated_mins = np.unique(np.append(updated_mins, recovered_idx)).astype(int)
             recovered_mins.append(recovered_idx)
-
     else:
         candidates = signal.argrelmax(local_thickness, order=effective_order)[0]
         candidates = candidates + padded_start
         candidates = candidates[(candidates > region_start) & (candidates < region_end)]
-
         if len(candidates) > 0:
             recovered_idx = int(candidates[np.argmax(thickness_values[candidates])])
             updated_maxs = np.unique(np.append(updated_maxs, recovered_idx)).astype(int)
@@ -187,18 +164,17 @@ def recover_missing_extremum(
 def _effective_savgol_window(
     segment_length: int,
     requested_window: int,
-    polyorder: int,
+    polyorder: int = 2,
 ) -> int | None:
     """Return a valid odd Savitzky-Golay window for one B -> D segment."""
-    if segment_length < 5 or polyorder < 2:
+    if segment_length < 5 or polyorder < 1:
         return None
 
     max_window = segment_length if segment_length % 2 == 1 else segment_length - 1
-    window = max(int(requested_window), polyorder + 2)
+    window = max(int(requested_window), polyorder + 1)
     if window % 2 == 0:
         window += 1
     window = min(window, max_window)
-
     if window <= polyorder:
         return None
     return window
@@ -209,30 +185,41 @@ def _detect_transition_index(
     thickness_values: np.ndarray,
     max_idx: int,
     min2_idx: int,
-    smoothing_window: int = 11,
+    smoothing_window: int = 5,
+    onset_fraction: float = 0.35,
+    persistence: int = 2,
     polyorder: int = 2,
-    min_width: float = 5.0,
+    min_width: float | None = None,
 ) -> int | None:
-    """Locate Point C from a broad, persistent negative-curvature feature.
+    """Locate Point C as the onset of the rapid etch-rate regime.
 
-    Point C is intended to mark the transition into the final ALE-related drop,
-    not simply the sharpest individual step between samples. To reduce the
-    sensitivity of the old raw second-derivative method to abrupt C -> D jumps:
+    Point C is defined physically as the start of the sustained rapid thickness
+    decrease that leads to Point D. The detector therefore does *not* use the
+    largest second derivative or the center of a large inflection.
 
-    1. Smooth the B -> D thickness trace with a low-order Savitzky-Golay fit.
-    2. Compute first and second derivatives using the measured time spacing.
-    3. Search the negative second derivative for local peaks.
-    4. Require a minimum peak width so one- or two-sample step artifacts are
-       rejected even when their instantaneous curvature is very large.
-    5. Choose the remaining candidate with the greatest prominence.
+    Procedure for each B -> D segment:
+      1. Lightly smooth thickness with a low-order Savitzky-Golay filter.
+      2. Compute dh/dt and find the most negative slope (strongest etch rate).
+      3. Estimate the pre-etch/purge slope from the early part of B -> etch.
+      4. Set an onset threshold between the purge slope and strongest etch slope.
+      5. Walk backward from the strongest etch point to the beginning of the
+         connected threshold-crossing region. That beginning is Point C.
+      6. Require the etch-rate region to persist for at least ``persistence``
+         samples so isolated derivative noise does not create Point C.
 
-    ``polyorder`` is intentionally restricted to 2 or 3. Higher-order local
-    polynomials can follow sharp point-to-point structure and reintroduce the
-    sensitivity this filter is designed to suppress.
+    ``onset_fraction`` controls how far from purge toward the maximum etch rate
+    the threshold lies. Lower values detect an earlier onset; higher values put
+    C closer to the steep drop. ``min_width`` is retained only for compatibility
+    with an older dashboard version and is intentionally ignored.
     """
-    if polyorder not in (2, 3):
+    del min_width
+
+    if not (0.01 <= float(onset_fraction) <= 0.95):
         return None
-    if min_width < 1:
+    persistence = int(persistence)
+    if persistence < 1:
+        return None
+    if polyorder not in (2, 3):
         return None
 
     segment_time = np.asarray(time_values[max_idx : min2_idx + 1], dtype=float)
@@ -240,13 +227,10 @@ def _detect_transition_index(
         thickness_values[max_idx : min2_idx + 1], dtype=float
     )
 
-    if len(segment_time) < 7:
+    if len(segment_time) < 5:
         return None
     if not np.isfinite(segment_time).all() or not np.isfinite(segment_thickness).all():
         return None
-
-    # Derivatives require strictly increasing time. Duplicate or reversed time
-    # points are rejected rather than silently generating unstable gradients.
     if np.any(np.diff(segment_time) <= 0):
         return None
 
@@ -262,38 +246,36 @@ def _detect_transition_index(
         polyorder=polyorder,
         mode="interp",
     )
-
     slope = np.gradient(smoothed_thickness, segment_time)
-    second_derivative = np.gradient(slope, segment_time)
 
-    # Negative second derivative means the downward slope is becoming steeper.
-    # Search its magnitude as a positive peak signal.
-    transition_strength = -second_derivative
+    if len(slope) < 3 or not np.isfinite(slope[1:-1]).any():
+        return None
+    etch_local_idx = int(np.nanargmin(slope[1:-1]) + 1)
+    strongest_etch_slope = float(slope[etch_local_idx])
 
-    # Savitzky-Golay interpolation is least trustworthy at the window edges, and
-    # B/D themselves are extrema rather than Point C candidates.
-    edge_buffer = max(2, effective_window // 2)
-    if len(transition_strength) <= 2 * edge_buffer + 1:
-        edge_buffer = 1
-
-    interior_strength = transition_strength[edge_buffer:-edge_buffer]
-    if len(interior_strength) < 3 or not np.isfinite(interior_strength).any():
+    pre_etch_slopes = slope[1:etch_local_idx]
+    if len(pre_etch_slopes) == 0 or not np.isfinite(pre_etch_slopes).any():
         return None
 
-    # Width is measured in samples at half prominence. The minimum-width rule is
-    # the main safeguard against a very steep but nearly instantaneous C -> D
-    # step overwhelming a broader process transition.
-    peaks, properties = signal.find_peaks(
-        interior_strength,
-        prominence=0,
-        width=float(min_width),
+    baseline_count = max(1, min(5, int(np.ceil(len(pre_etch_slopes) * 0.5))))
+    purge_slope = float(np.nanmedian(pre_etch_slopes[:baseline_count]))
+
+    if not np.isfinite(purge_slope) or strongest_etch_slope >= purge_slope:
+        return None
+
+    onset_threshold = purge_slope + float(onset_fraction) * (
+        strongest_etch_slope - purge_slope
     )
-    if len(peaks) == 0:
+
+    onset_local_idx = etch_local_idx
+    while onset_local_idx > 1 and slope[onset_local_idx - 1] <= onset_threshold:
+        onset_local_idx -= 1
+
+    run_length = etch_local_idx - onset_local_idx + 1
+    if run_length < persistence:
         return None
 
-    best_peak = int(peaks[np.argmax(properties["prominences"])])
-    transition_local_idx = edge_buffer + best_peak
-    return max_idx + transition_local_idx
+    return max_idx + onset_local_idx
 
 
 def calculate_cycles(
@@ -302,20 +284,13 @@ def calculate_cycles(
     thickness_values: np.ndarray,
     recovered_min_indices: list[int] | None = None,
     recovered_max_indices: list[int] | None = None,
-    transition_smoothing_window: int = 11,
+    transition_smoothing_window: int = 5,
+    transition_onset_fraction: float = 0.35,
+    transition_persistence: int = 2,
     transition_polyorder: int = 2,
-    transition_min_width: float = 5.0,
+    transition_min_width: float | None = None,
 ) -> CycleAnalysisResult:
-    """Calculate complete ALD/ALE-process MIN -> MAX -> MIN cycles.
-
-    A = first minimum
-    B = maximum
-    C = broad transition point between B and D
-    D = next minimum
-    Delta 1 = B - A
-    Delta 2 = B - C
-    Delta 3 = C - D
-    """
+    """Calculate complete ALD/ALE-process MIN -> MAX -> C -> MIN cycles."""
     recovered_min_set = set(recovered_min_indices or [])
     recovered_max_set = set(recovered_max_indices or [])
 
@@ -337,7 +312,6 @@ def calculate_cycles(
             and point_b["Type"] == "max"
             and point_d["Type"] == "min"
         )
-
         if not is_complete_cycle:
             if point_a["Type"] == "min":
                 rejected_sequences += 1
@@ -346,7 +320,6 @@ def calculate_cycles(
         point_a_idx = int(point_a["Index"])
         point_b_idx = int(point_b["Index"])
         point_d_idx = int(point_d["Index"])
-
         thickness_a = float(point_a["Thickness"])
         thickness_b = float(point_b["Thickness"])
         thickness_d = float(point_d["Thickness"])
@@ -357,10 +330,11 @@ def calculate_cycles(
             max_idx=point_b_idx,
             min2_idx=point_d_idx,
             smoothing_window=transition_smoothing_window,
+            onset_fraction=transition_onset_fraction,
+            persistence=transition_persistence,
             polyorder=transition_polyorder,
             min_width=transition_min_width,
         )
-
         if transition_idx is None:
             derivative_failures += 1
             continue
@@ -373,7 +347,6 @@ def calculate_cycles(
             or point_d_idx in recovered_min_set
             or point_b_idx in recovered_max_set
         )
-
         if cycle_uses_recovered_extremum:
             recovered_transition_indices.append(transition_idx)
         else:
@@ -401,7 +374,6 @@ def calculate_cycles(
         )
 
     cycle_df = format_cycle_results(pd.DataFrame(cycles))
-
     return CycleAnalysisResult(
         cycle_df=cycle_df,
         transition_indices=sorted(set(transition_indices)),
