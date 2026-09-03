@@ -12,9 +12,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Streamlit can rerun app.py without fully re-importing local modules. Reload the
-# analysis module explicitly so a newly deployed analysis.py cannot leave this
-# app calling an older calculate_cycles() signature from memory.
+# Reload local analysis logic on Streamlit reruns so deployments do not retain an
+# older calculate_cycles() signature in memory.
 import analysis as analysis_core
 analysis_core = importlib.reload(analysis_core)
 
@@ -43,11 +42,32 @@ def load_csv(file_bytes: bytes) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(file_bytes))
 
 
-def prepare_numeric_data(df: pd.DataFrame, time_col: str, thickness_col: str) -> pd.DataFrame:
+def prepare_numeric_data(
+    df: pd.DataFrame, time_col: str, thickness_col: str
+) -> pd.DataFrame:
+    """Coerce selected columns to numeric and normalize to forward physical time."""
     cleaned = df[[time_col, thickness_col]].copy()
     cleaned[time_col] = pd.to_numeric(cleaned[time_col], errors="coerce")
     cleaned[thickness_col] = pd.to_numeric(cleaned[thickness_col], errors="coerce")
-    return cleaned.dropna().reset_index(drop=True)
+    cleaned = cleaned.dropna().copy()
+
+    # All extrema and Point C definitions are physical-time definitions. Sorting
+    # here makes a reverse-chronological Excel export behave identically to an
+    # ascending-time export.
+    return cleaned.sort_values(time_col, kind="mergesort").reset_index(drop=True)
+
+
+def classify_time_order(df: pd.DataFrame, time_col: str) -> str:
+    """Describe the order of valid time values in the uploaded file."""
+    values = pd.to_numeric(df[time_col], errors="coerce").dropna().to_numpy(dtype=float)
+    if len(values) < 2:
+        return "insufficient"
+    diffs = np.diff(values)
+    if np.all(diffs >= 0):
+        return "ascending"
+    if np.all(diffs <= 0):
+        return "descending"
+    return "mixed"
 
 
 def plot_full_dataset(df, time_col, thickness_col, start_time, end_time) -> None:
@@ -137,7 +157,7 @@ def plot_cycle_analysis(
             thickness_values[transition_indices],
             s=100,
             marker="^",
-            label="Point C (ALD/ALE transition)",
+            label="Point C (etch onset)",
         )
     if recovered_transition_indices:
         ax.scatter(
@@ -161,31 +181,51 @@ def show_interpretation_guide() -> None:
         st.markdown(
             """
 **Complete-cycle rule**  
-Only successive **minimum → maximum → minimum** sequences are included.
+Only successive **minimum → maximum → minimum** sequences in forward physical
+time are included.
 
 **ALD/ALE Process**
 - **Point A** = first minimum
 - **Point B** = maximum
-- **Point C** = broad transition into the final ALE-related drop
+- **Point C** = onset of the sustained rapid etch-related thickness decrease
 - **Point D** = next minimum
 - **Δ1 = B − A**
 - **Δ2 = B − C**
 - **Δ3 = C − D**
 
-**Point C transition detection**  
-The B → D segment is smoothed with a low-order Savitzky-Golay polynomial before
-first and second derivatives are calculated. Point C is selected from a broad
-negative-curvature feature. The minimum-width filter rejects very narrow
-curvature spikes caused by abrupt point-to-point changes.
+**Point C: etch-onset detection**  
+For each B → D segment, the thickness trace is lightly smoothed and its slope
+**dh/dt** is calculated. The algorithm first finds the most negative slope,
+which identifies the rapid etch event. It then walks **backward in physical
+time** from that event until the slope returns toward the purge/pre-etch regime.
+The beginning of that connected rapid-slope region is Point C.
 
-The polynomial order is intentionally limited to **2 or 3**. Increase the
-minimum transition width if a sharp C → D step is still being selected instead
-of the broader transition.
+An instantaneous etch is therefore allowed; it is not rejected for being narrow.
+Point C is intended to sit at the **onset** of the drop rather than at the center
+of the largest inflection.
+
+**Etch onset threshold**  
+This is the percentage of the slope change from the purge baseline toward the
+strongest etch rate required to enter the etch regime. Lower percentages detect
+an earlier/more sensitive onset. Higher percentages put Point C closer to the
+steepest drop.
+
+**Persistence**  
+The slope must remain in the etch-rate regime through the strongest etch point
+for at least this many samples. Use 1 for an extremely short event; 2 is the
+default to reject an isolated derivative fluctuation without suppressing a rapid
+etch.
+
+**Time direction**  
+Uploaded data are automatically sorted by the selected time column before
+analysis. This makes ascending- and descending-time exports use the same physical
+definition of A, B, C, and D. Reported point indices refer to this chronologically
+sorted analysis window, not necessarily the original Excel row number.
 
 **Extrema order**  
 The minimum and maximum filter orders control how many neighboring points a
-candidate must beat to count as a local extremum. These are independent of the
-Point C smoothing controls.
+candidate must beat to count as a local extremum. They are independent of Point
+C detection.
 
 **Missing-point recovery**  
 MAX → MAX suggests a missing minimum; MIN → MIN suggests a missing maximum.
@@ -237,10 +277,28 @@ if time_col == thickness_col:
     st.error("Choose different columns for time and thickness.")
     st.stop()
 
+input_time_order = classify_time_order(raw_df, time_col)
 full_df = prepare_numeric_data(raw_df, time_col, thickness_col)
+
 if len(full_df) < 3:
     st.error("Not enough numeric data points were found after cleaning.")
     st.stop()
+
+if input_time_order == "descending":
+    st.info(
+        "The uploaded time column runs backward. It has been reordered into "
+        "ascending physical time before A/B/C/D detection."
+    )
+elif input_time_order == "mixed":
+    st.warning(
+        "The uploaded time column is not monotonic. Rows have been sorted by time "
+        "before analysis; verify that this is appropriate for the dataset."
+    )
+
+st.caption(
+    "Point indices below refer to the chronologically sorted analysis window; "
+    "Point times are the recommended reference when comparing files."
+)
 
 st.sidebar.header("Analysis window")
 window_start, window_end = st.sidebar.slider(
@@ -281,30 +339,47 @@ if min_order > window_max_order or max_order > window_max_order:
         "The selected extrema order is large relative to the current analysis window."
     )
 
-st.sidebar.header("Point C transition filter")
-max_transition_window = min(101, max(5, len(analysis_df)))
+st.sidebar.header("Point C: etch onset")
+max_transition_window = min(51, max(5, len(analysis_df)))
 if max_transition_window % 2 == 0:
     max_transition_window -= 1
 max_transition_window = max(5, max_transition_window)
-default_transition_window = min(11, max_transition_window)
 
 transition_smoothing_window = st.sidebar.slider(
     "Smoothing window (samples)",
     min_value=5,
     max_value=max_transition_window,
-    value=default_transition_window,
+    value=min(5, max_transition_window),
     step=2,
+    help=(
+        "Light smoothing before dh/dt is calculated. Keep this small for "
+        "near-instantaneous etch events."
+    ),
 )
-transition_polyorder = st.sidebar.select_slider(
-    "Polynomial order", options=[2, 3], value=2
+
+onset_percent = st.sidebar.slider(
+    "Etch onset threshold (% of slope change)",
+    min_value=10,
+    max_value=80,
+    value=35,
+    step=5,
+    help=(
+        "Lower values place C earlier at the first departure from purge. "
+        "Higher values place C closer to the steepest etch slope."
+    ),
 )
-transition_min_width = st.sidebar.slider(
-    "Minimum transition width (samples)",
-    min_value=2,
-    max_value=20,
-    value=5,
+transition_onset_fraction = onset_percent / 100.0
+
+transition_persistence = st.sidebar.slider(
+    "Etch persistence (samples)",
+    min_value=1,
+    max_value=5,
+    value=2,
     step=1,
-    help="Increase this to reject narrow, steep C→D curvature spikes.",
+    help=(
+        "Minimum number of connected etch-regime slope samples through the "
+        "strongest etch point. Set to 1 for a one-sample/very rapid event."
+    ),
 )
 
 min_indices, max_indices = detect_extrema(thickness_values, min_order, max_order)
@@ -357,10 +432,8 @@ if use_recovery:
 
 events = build_events(min_indices, max_indices, time_values, thickness_values)
 
-# Build the call from the function signature. This makes a Streamlit process
-# tolerant of the previous 3-step calculate_cycles signature during a hot reload,
-# while using all new ALD/ALE transition controls whenever the current analysis.py
-# is loaded.
+# Signature-aware call keeps a running Streamlit process compatible during hot
+# deployments while using the current etch-onset parameters when available.
 calculate_kwargs = {
     "events": events,
     "time_values": time_values,
@@ -374,10 +447,18 @@ if "analysis_type" in cycle_parameters:
     calculate_kwargs["analysis_type"] = "3-step"
 if "transition_smoothing_window" in cycle_parameters:
     calculate_kwargs["transition_smoothing_window"] = transition_smoothing_window
+if "transition_onset_fraction" in cycle_parameters:
+    calculate_kwargs["transition_onset_fraction"] = transition_onset_fraction
+if "transition_persistence" in cycle_parameters:
+    calculate_kwargs["transition_persistence"] = transition_persistence
 if "transition_polyorder" in cycle_parameters:
-    calculate_kwargs["transition_polyorder"] = transition_polyorder
-if "transition_min_width" in cycle_parameters:
-    calculate_kwargs["transition_min_width"] = transition_min_width
+    calculate_kwargs["transition_polyorder"] = 2
+# Compatibility only for an older broad-curvature version of analysis.py.
+if (
+    "transition_min_width" in cycle_parameters
+    and "transition_onset_fraction" not in cycle_parameters
+):
+    calculate_kwargs["transition_min_width"] = 2
 
 result = calculate_cycles(**calculate_kwargs)
 cycle_df = result.cycle_df
@@ -408,17 +489,17 @@ row2 = st.columns(4)
 row2[0].metric("Detected minima", len(min_indices))
 row2[1].metric("Detected maxima", len(max_indices))
 row2[2].metric("Rejected sequences", result.rejected_sequences)
-row2[3].metric("Transition failures", result.derivative_failures)
+row2[3].metric("Point C failures", result.derivative_failures)
 
 if len(cycle_df) > 0:
     st.success(
         f"{len(cycle_df)} complete minimum → maximum → minimum cycles were identified. "
-        "Only cycles with a valid Point C transition are included in Δ1/Δ2/Δ3."
+        "Only cycles with a valid etch-onset Point C are included in Δ1/Δ2/Δ3."
     )
 else:
     st.warning(
-        "No complete cycles with a valid Point C transition were detected. Adjust "
-        "the analysis window, extrema orders, smoothing window, or transition width."
+        "No complete cycles with a valid Point C were detected. Adjust the analysis "
+        "window, extrema orders, onset threshold, persistence, or smoothing window."
     )
 
 st.subheader("Δ1, Δ2, and Δ3 by cycle")
