@@ -65,17 +65,8 @@ def plot_full_dataset(
     fig, ax = plt.subplots(figsize=(16, 5))
     ax.plot(plot_x, plot_y, linewidth=2, alpha=0.7)
 
-    # Show the current analysis-window boundaries on the full trace.
-    ax.axvline(
-        x=start_time,
-        linestyle="--",
-        linewidth=2,
-    )
-    ax.axvline(
-        x=end_time,
-        linestyle="--",
-        linewidth=2,
-    )
+    ax.axvline(x=start_time, linestyle="--", linewidth=2)
+    ax.axvline(x=end_time, linestyle="--", linewidth=2)
 
     ax.set_xlabel(time_col)
     ax.set_ylabel(thickness_col)
@@ -92,12 +83,11 @@ def plot_cycle_analysis(
     recovered_max_indices: list[int],
     transition_indices: list[int],
     recovered_transition_indices: list[int],
-    analysis_type: str,
     time_col: str,
     thickness_col: str,
     selected_issue: dict | None,
 ) -> None:
-    """Plot extrema and transitions while keeping the line rendering efficient."""
+    """Plot extrema and ALD/ALE transition points efficiently."""
     plot_time, plot_thickness = downsample_for_plot(
         time_values, thickness_values, max_points=8000
     )
@@ -154,29 +144,25 @@ def plot_cycle_analysis(
             label="Recovered maximum",
         )
 
-    if analysis_type == "3-step":
-        if transition_indices:
-            ax.scatter(
-                time_values[transition_indices],
-                thickness_values[transition_indices],
-                s=100,
-                marker="^",
-                label="Point C (transition)",
-            )
+    if transition_indices:
+        ax.scatter(
+            time_values[transition_indices],
+            thickness_values[transition_indices],
+            s=100,
+            marker="^",
+            label="Point C (ALD/ALE transition)",
+        )
 
-        if recovered_transition_indices:
-            ax.scatter(
-                time_values[recovered_transition_indices],
-                thickness_values[recovered_transition_indices],
-                s=160,
-                marker="*",
-                label="Point C from recovered cycle",
-            )
+    if recovered_transition_indices:
+        ax.scatter(
+            time_values[recovered_transition_indices],
+            thickness_values[recovered_transition_indices],
+            s=160,
+            marker="*",
+            label="Point C from recovered cycle",
+        )
 
-        ax.set_title("3-Step Delta Analyzer")
-    else:
-        ax.set_title("2-Step Delta Analyzer")
-
+    ax.set_title("ALD/ALE Process Delta Analyzer")
     ax.set_xlabel(time_col)
     ax.set_ylabel(thickness_col)
     ax.legend()
@@ -194,31 +180,32 @@ Only successive **minimum → maximum → minimum** sequences are included in th
 results. Incomplete or nonmatching extrema sequences do not contribute to the
 reported averages.
 
-**2-step mode**
+**ALD/ALE Process**
 - **Point A** = first minimum
 - **Point B** = maximum
-- **Point D** = next minimum
-- **Δ1 = B − A**
-- **Δ2 = B − D**
-- Point C and Δ3 are intentionally blank.
-
-**3-step mode**
-- **Point A** = first minimum
-- **Point B** = maximum
-- **Point C** = transition immediately before the stronger final drop
+- **Point C** = broad transition into the final ALE-related drop
 - **Point D** = next minimum
 - **Δ1 = B − A**
 - **Δ2 = B − C**
 - **Δ3 = C − D**
 
-Point C is found from the strongest negative change in slope within the B → D
-segment. It should be visually checked because a noisy trace can occasionally
-produce a stronger derivative change than the physically intended transition.
+**Point C transition detection**  
+The B → D segment is first smoothed with a low-order Savitzky-Golay polynomial.
+The first and second derivatives are then calculated, and Point C is selected
+from a **broad negative-curvature feature** rather than simply taking the
+largest point-to-point change in slope. A minimum peak-width requirement rejects
+very narrow curvature spikes caused by abrupt C → D steps.
+
+The transition polynomial order is intentionally limited to **2 or 3**. Lower
+order prevents the local fit from following every sharp point-to-point feature.
+Increasing the minimum transition width makes Point C detection more selective
+against narrow step-like changes.
 
 **Extrema `order`**  
 The minimum and maximum order values control how much neighboring data a point
 must beat to count as a local extremum. Larger values suppress small features;
 smaller values make detection more sensitive to local structure and noise.
+These extrema orders are separate from the Point C polynomial order.
 
 **Missing-point recovery**  
 A **MAX → MAX** sequence is treated as a possible missing minimum, while a
@@ -235,9 +222,9 @@ existing global extrema.
 st.set_page_config(page_title="Thickness Cycle Delta Analyzer", layout="wide")
 st.title("Thickness Cycle Delta Analyzer")
 st.write(
-    "Analyze cyclic thickness-vs-time data with local-extrema detection, "
-    "strict complete-cycle validation, optional missing-point recovery, and "
-    "2-step or 3-step delta calculations."
+    "Analyze cyclic thickness-vs-time data for the ALD/ALE process with "
+    "local-extrema detection, strict complete-cycle validation, optional "
+    "missing-point recovery, and Δ1/Δ2/Δ3 calculations."
 )
 show_interpretation_guide()
 
@@ -298,7 +285,6 @@ analysis_df = full_df.iloc[window_start : window_end + 1].reset_index(drop=True)
 time_values = analysis_df[time_col].to_numpy(dtype=float)
 thickness_values = analysis_df[thickness_col].to_numpy(dtype=float)
 
-# Use the selected endpoints to mark the active analysis window on the overview.
 start_time = float(full_df.iloc[window_start][time_col])
 end_time = float(full_df.iloc[window_end][time_col])
 
@@ -314,15 +300,8 @@ plot_full_dataset(
 max_allowed_order = max(1, min(250, (len(full_df) - 1) // 2))
 default_order = min(10, max_allowed_order)
 
-st.sidebar.header("Analysis type")
-analysis_type = st.sidebar.radio(
-    "Cycle analysis", ["2-step", "3-step"], index=1
-)
-
-if analysis_type == "2-step":
-    st.sidebar.caption("Δ1 = B − A, Δ2 = B − D")
-else:
-    st.sidebar.caption("Δ1 = B − A, Δ2 = B − C, Δ3 = C − D")
+st.sidebar.header("ALD/ALE Process")
+st.sidebar.caption("Δ1 = B − A, Δ2 = B − C, Δ3 = C − D")
 
 st.sidebar.header("Extrema filters")
 min_order = st.sidebar.slider(
@@ -348,6 +327,45 @@ if min_order > window_max_order or max_order > window_max_order:
         "The selected order is large relative to the current analysis window. "
         "Consider reducing the order or expanding the window."
     )
+
+st.sidebar.header("Point C transition filter")
+max_transition_window = min(101, max(5, len(analysis_df)))
+if max_transition_window % 2 == 0:
+    max_transition_window -= 1
+max_transition_window = max(5, max_transition_window)
+default_transition_window = min(11, max_transition_window)
+
+transition_smoothing_window = st.sidebar.slider(
+    "Smoothing window (samples)",
+    min_value=5,
+    max_value=max_transition_window,
+    value=default_transition_window,
+    step=2,
+    help=(
+        "Odd Savitzky-Golay window used before derivatives are calculated. "
+        "Larger windows suppress more point-to-point structure."
+    ),
+)
+transition_polyorder = st.sidebar.select_slider(
+    "Polynomial order",
+    options=[2, 3],
+    value=2,
+    help=(
+        "Intentionally limited to low order so the local fit does not follow "
+        "sharp step-like features too closely."
+    ),
+)
+transition_min_width = st.sidebar.slider(
+    "Minimum transition width (samples)",
+    min_value=2,
+    max_value=20,
+    value=5,
+    step=1,
+    help=(
+        "Curvature features narrower than this are rejected. Increase this if "
+        "a very steep C→D step is being mistaken for Point C."
+    ),
+)
 
 # -----------------------------------------------------------------------------
 # Global extrema detection and optional local recovery
@@ -407,7 +425,6 @@ if use_recovery:
                 "No local candidate was found in this gap at the selected order."
             )
 
-# Rebuild the final event sequence only after recovery has been applied.
 events = build_events(min_indices, max_indices, time_values, thickness_values)
 
 # -----------------------------------------------------------------------------
@@ -417,13 +434,15 @@ result = calculate_cycles(
     events=events,
     time_values=time_values,
     thickness_values=thickness_values,
-    analysis_type=analysis_type,
     recovered_min_indices=recovered_min_indices,
     recovered_max_indices=recovered_max_indices,
+    transition_smoothing_window=transition_smoothing_window,
+    transition_polyorder=transition_polyorder,
+    transition_min_width=transition_min_width,
 )
 cycle_df = result.cycle_df
 
-st.subheader(f"{analysis_type} Cycle Detection")
+st.subheader("ALD/ALE Process Cycle Detection")
 plot_cycle_analysis(
     time_values=time_values,
     thickness_values=thickness_values,
@@ -433,7 +452,6 @@ plot_cycle_analysis(
     recovered_max_indices=recovered_max_indices,
     transition_indices=result.transition_indices,
     recovered_transition_indices=result.recovered_transition_indices,
-    analysis_type=analysis_type,
     time_col=time_col,
     thickness_col=thickness_col,
     selected_issue=selected_issue,
@@ -456,34 +474,30 @@ row2[2].metric("Rejected sequences", result.rejected_sequences)
 row2[3].metric("Transition failures", result.derivative_failures)
 
 if len(cycle_df) > 0:
-    included_deltas = "Δ1 and Δ2" if analysis_type == "2-step" else "Δ1, Δ2, and Δ3"
     st.success(
         f"{len(cycle_df)} complete minimum → maximum → minimum cycles were identified. "
-        f"Only these complete cycles are included in the {included_deltas} calculations."
+        "Only these complete cycles with a valid broad Point C transition are "
+        "included in the Δ1, Δ2, and Δ3 calculations."
     )
 else:
     st.warning(
-        "No complete minimum → maximum → minimum cycles were detected. "
-        "Adjust the analysis window and/or extrema filter order."
+        "No complete cycles with a valid Point C transition were detected. "
+        "Adjust the analysis window, extrema filter order, smoothing window, "
+        "and/or minimum transition width."
     )
 
-st.subheader("Δ1 and Δ2 by cycle" if analysis_type == "2-step" else "Δ1, Δ2, and Δ3 by cycle")
+st.subheader("Δ1, Δ2, and Δ3 by cycle")
 
 if cycle_df.empty:
-    st.write("No complete cycles are available in the selected analysis window.")
+    st.write("No complete ALD/ALE cycles are available in the selected analysis window.")
 else:
     st.dataframe(cycle_df, use_container_width=True, hide_index=True)
 
     st.subheader("Average Δ Values")
-    if analysis_type == "2-step":
-        cols = st.columns(2)
-        cols[0].metric("Average Δ1", f"{cycle_df['Delta 1'].mean():.4f}")
-        cols[1].metric("Average Δ2", f"{cycle_df['Delta 2'].mean():.4f}")
-    else:
-        cols = st.columns(3)
-        cols[0].metric("Average Δ1", f"{cycle_df['Delta 1'].mean():.4f}")
-        cols[1].metric("Average Δ2", f"{cycle_df['Delta 2'].mean():.4f}")
-        cols[2].metric("Average Δ3", f"{cycle_df['Delta 3'].mean():.4f}")
+    cols = st.columns(3)
+    cols[0].metric("Average Δ1", f"{cycle_df['Delta 1'].mean():.4f}")
+    cols[1].metric("Average Δ2", f"{cycle_df['Delta 2'].mean():.4f}")
+    cols[2].metric("Average Δ3", f"{cycle_df['Delta 3'].mean():.4f}")
 
     csv = cycle_df.to_csv(index=False).encode("utf-8")
     st.download_button(
