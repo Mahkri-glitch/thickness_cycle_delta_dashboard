@@ -1,92 +1,69 @@
 # Thickness Cycle Delta Analyzer
 
-A Streamlit dashboard for analyzing cyclic thickness-vs-time data for an **ALD/ALE process**. The program detects repeated extrema, validates complete cycles, identifies the Point C process transition, and reports Δ1, Δ2, and Δ3 for each valid cycle.
+A Streamlit dashboard for analyzing cyclic thickness-vs-time data for an **ALD/ALE process**. The program detects repeated extrema, validates complete cycles, identifies Point C as the **onset of the rapid etch-related thickness decrease**, and reports Δ1, Δ2, and Δ3 for each valid cycle.
 
-The dashboard uses a strict **minimum → maximum → minimum** cycle rule. Only complete successive cycles with a valid Point C transition are included in the reported deltas and averages.
-
-## What the program does
-
-1. Loads a CSV or Excel thickness-vs-time dataset.
-2. Lets the user select an analysis window.
-3. Detects local minima and maxima with `scipy.signal.argrelmin` and `scipy.signal.argrelmax`.
-4. Keeps only complete successive `MIN → MAX → MIN` cycles.
-5. Locates Point C from a broad curvature transition within the B → D segment.
-6. Calculates Δ1, Δ2, and Δ3 for the ALD/ALE process.
-7. Optionally searches for one missing local extremum in a broken alternation region.
-8. Displays diagnostics, the annotated trace, per-cycle results, averages, and a downloadable CSV.
+The dashboard uses a strict **minimum → maximum → minimum** rule in **forward physical time**.
 
 ## ALD/ALE process definition
-
-Each valid cycle uses four points:
 
 ```text
 A = first minimum
 B = maximum
-C = broad transition into the final ALE-related drop
+C = onset of the sustained rapid etch-related thickness decrease
 D = next minimum
-```
 
-The reported quantities are:
-
-```text
 Δ1 = B - A
 Δ2 = B - C
 Δ3 = C - D
 ```
 
-## Point C transition detection
+## Point C: etch-onset detection
 
-The previous implementation selected the single strongest negative change in slope. That made Point C sensitive to a very sharp C → D step because a nearly instantaneous drop can produce a much larger raw second-derivative response than the broader physical transition.
+Point C is no longer defined as the largest second-derivative response or the center of the strongest inflection. That definition can fail when the physically meaningful etch step is nearly instantaneous, because the largest curvature naturally occurs inside the sharp drop.
 
-The current detector is designed to favor a **persistent transition** instead of the sharpest individual step:
+For each B → D segment the current detector:
 
-1. Extract the B → D thickness segment.
-2. Smooth the segment with a low-order Savitzky-Golay polynomial.
-3. Calculate the first and second derivatives using the measured time coordinates.
-4. Search the negative second derivative for curvature peaks.
-5. Reject curvature peaks that are narrower than the selected minimum transition width.
-6. Choose the remaining candidate with the greatest prominence as Point C.
+1. lightly smooths thickness with a low-order Savitzky-Golay filter,
+2. calculates the first derivative `dh/dt`,
+3. finds the most negative slope, which identifies the strongest etch rate,
+4. estimates the purge/pre-etch slope before that event,
+5. defines an onset threshold between the purge slope and strongest etch slope, and
+6. walks backward from the strongest etch point to the start of the connected threshold-crossing region.
 
-### Point C controls
+The start of that region is Point C. A narrow or nearly instantaneous etch is therefore allowed rather than intentionally filtered out.
 
-The sidebar contains three transition-filter settings:
+## Point C controls
 
-- **Smoothing window (samples)** — controls how much local point-to-point structure is suppressed before derivatives are calculated. The window is always odd.
-- **Polynomial order** — intentionally restricted to **2 or 3** so the local fit does not follow high-order wiggles or sharp point-to-point features too closely.
-- **Minimum transition width (samples)** — rejects narrow curvature peaks. Increase this value when a steep C → D step is still being mistaken for Point C.
+- **Smoothing window (samples)** — light smoothing before `dh/dt` is calculated. The default is 5 samples so a rapid etch is not excessively broadened.
+- **Etch onset threshold (% of slope change)** — default 35%. Lower values detect an earlier onset; higher values place C closer to the steepest etch slope.
+- **Etch persistence (samples)** — default 2. The etch-rate region must remain connected through the strongest etch point for at least this many samples. Use 1 for an extremely short event.
 
-The default settings are:
+The Savitzky-Golay polynomial order is fixed internally at 2 for the dashboard rather than exposed as a primary physical control.
 
-```text
-Smoothing window = 11 samples
-Polynomial order = 2
-Minimum transition width = 5 samples
-```
+## Time direction
 
-These values are starting points rather than universal physical constants. Point C should still be visually inspected against the measured trace.
+The uploaded file may be ordered with time increasing or decreasing. The dashboard automatically sorts the selected time column into **ascending chronological order before any extrema or Point C calculations**.
 
-## Understanding the extrema `order` settings
+This is important because Point C is defined as the onset of etching in forward physical time. Without this normalization, a reverse-chronological export would make the algorithm walk toward the wrong side of the etch event and would also reverse the interpretation of A/B/D cycle boundaries.
 
-The minimum and maximum extrema orders are separate from the Point C polynomial order.
+If the file is detected as descending in time, the dashboard displays a notice. If the time values are non-monotonic, it displays a warning and still sorts them before analysis.
 
-SciPy's relative-extrema `order` determines how many neighboring samples a candidate point must beat to count as a minimum or maximum:
+Because of this normalization, reported point indices refer to the **chronologically sorted analysis window**, not necessarily the original Excel row number. Point times are the recommended reference when comparing datasets.
 
-- **Smaller order**: more sensitive; may detect small features or noise.
-- **Larger order**: more selective; suppresses smaller local extrema.
+## Extrema detection
 
-The minimum and maximum orders are independent because the two sides of a cycle can have different shapes or noise characteristics.
-
-## Complete-cycle requirement
-
-A cycle contributes to the results only when the detected extrema appear in this exact order:
+A cycle contributes only when extrema occur as:
 
 ```text
 minimum → maximum → minimum
 ```
 
-If the sequence is incomplete, interrupted by an extra extremum, or truncated by the selected analysis-window boundary, it is not included in the delta averages.
+SciPy relative-extrema `order` controls how many neighboring samples a candidate must beat to count as a local minimum or maximum:
 
-The dashboard does not force the detected number of cycles to match the programmed number of ALD/ALE cycles.
+- smaller order = more sensitive to local structure/noise,
+- larger order = more selective.
+
+Minimum and maximum orders are independent of Point C detection.
 
 ## Missing-point recovery
 
@@ -97,78 +74,36 @@ MAX → MAX  = possible missing MIN
 MIN → MIN  = possible missing MAX
 ```
 
-When recovery is enabled, the program performs a local extrema search inside the selected suspicious gap and adds one candidate:
+Recovery performs a local extrema search inside the selected gap and adds one candidate without deleting the globally detected extrema.
 
-- the deepest local minimum for a missing MIN, or
-- the highest local maximum for a missing MAX.
+## Input
 
-Recovery is **additive**. It does not delete globally detected extrema. If the restored extremum creates a valid complete cycle, Point C is recalculated automatically for that cycle.
-
-The broken-alternation method cannot reliably infer an entire missing physical cycle when the remaining extrema still alternate correctly.
-
-## Input format
-
-The program accepts:
+Supported files:
 
 - `.csv`
 - `.xlsx`
 - `.xls`
 
-The file needs at least two numeric columns. You select which column is time and which is thickness in the interface.
+Select the time and thickness columns in the interface.
 
-Example:
-
-```csv
-Time,Thickness
-0.0,1.23
-0.5,1.25
-1.0,1.31
-```
-
-A small synthetic example is included at:
-
-```text
-examples/synthetic_example.csv
-```
-
-## Installation
-
-### Windows PowerShell
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-### macOS / Linux
+## Run
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-```
-
-## Run the dashboard
-
-```bash
 python -m streamlit run app.py
 ```
 
 ## Recommended workflow
 
-1. Upload the dataset.
-2. Select the time and thickness columns.
-3. Use **Analysis window** to isolate the cyclic region of interest.
-4. Adjust the minimum and maximum extrema orders until A/B/D markers correspond to representative physical cycle points.
-5. Start Point C detection with polynomial order 2, smoothing window 11, and minimum transition width 5.
-6. Visually inspect Point C markers.
-7. If a narrow C → D step is being selected, increase **Minimum transition width** first; increase the smoothing window if additional suppression is needed.
-8. Check successful cycles, rejected sequences, and transition failures.
-9. Use Missing Point Recovery only when a clear local extremum is absent and broken alternation is detected.
-10. Download `cycle_delta_results.csv` for downstream analysis.
+1. Upload the dataset and select time/thickness columns.
+2. Confirm whether the dashboard reports that time was reversed and normalized.
+3. Select the analysis window.
+4. Tune minimum and maximum extrema orders so A/B/D markers follow the physical cycles.
+5. Start Point C with smoothing = 5, onset threshold = 35%, persistence = 2.
+6. If C is too far into the drop, lower the onset threshold.
+7. If C is triggered too early by noise, increase the onset threshold and/or persistence.
+8. For a truly one-sample etch event, set persistence = 1.
+9. Visually inspect Point C markers and download the CSV when satisfied.
 
 ## Output columns
 
@@ -181,45 +116,18 @@ Point D Index, Point D Time, Point D Thickness,
 Delta 1, Delta 2, Delta 3
 ```
 
-Indices are relative to the **selected analysis window**, not necessarily the original untrimmed file.
-
-## Diagnostics
-
-The dashboard reports:
-
-- full data points,
-- analyzed data points,
-- detected extrema,
-- successful cycles,
-- detected minima,
-- detected maxima,
-- rejected sequences, and
-- transition failures.
-
-A transition failure means a valid `MIN → MAX → MIN` extrema sequence was found but no curvature feature passed the Point C transition filters. This can occur when the B → D segment is too short, the time coordinate is not strictly increasing, or the minimum-width/smoothing settings are too restrictive for that cycle.
-
 ## Testing
 
-The test suite includes a regression case containing both a broad process transition and a much larger narrow terminal step. The Point C detector is expected to select the broad transition rather than the narrow step.
+The test suite includes:
 
-Install development dependencies and run:
+- an abrupt etch case where Point C must remain on the purge-side edge of the drop,
+- a gradual transition case where Point C must occur before the maximum etch rate,
+- a threshold-direction test verifying that a lower onset threshold moves C earlier or leaves it unchanged, and
+- cycle arithmetic/output-column checks.
+
+Run:
 
 ```bash
 python -m pip install -r requirements-dev.txt
 pytest -q
-```
-
-## Repository structure
-
-```text
-thickness_cycle_delta_dashboard/
-├── app.py                      # Streamlit interface and plotting
-├── analysis.py                 # Reusable scientific analysis functions
-├── requirements.txt            # Runtime dependencies
-├── requirements-dev.txt        # Development/test dependencies
-├── README.md                    # Usage and interpretation guide
-├── examples/
-│   └── synthetic_example.csv
-└── tests/
-    └── test_analysis.py
 ```
