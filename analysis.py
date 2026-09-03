@@ -7,13 +7,10 @@ can be tested, reused, and reasoned about separately from the user interface.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 import pandas as pd
 import scipy.signal as signal
-
-AnalysisType = Literal["2-step", "3-step"]
 
 OUTPUT_COLUMNS = [
     "Cycle",
@@ -187,39 +184,115 @@ def recover_missing_extremum(
     )
 
 
+def _effective_savgol_window(
+    segment_length: int,
+    requested_window: int,
+    polyorder: int,
+) -> int | None:
+    """Return a valid odd Savitzky-Golay window for one B -> D segment."""
+    if segment_length < 5 or polyorder < 2:
+        return None
+
+    max_window = segment_length if segment_length % 2 == 1 else segment_length - 1
+    window = max(int(requested_window), polyorder + 2)
+    if window % 2 == 0:
+        window += 1
+    window = min(window, max_window)
+
+    if window <= polyorder:
+        return None
+    return window
+
+
 def _detect_transition_index(
     time_values: np.ndarray,
     thickness_values: np.ndarray,
     max_idx: int,
     min2_idx: int,
+    smoothing_window: int = 11,
+    polyorder: int = 2,
+    min_width: float = 5.0,
 ) -> int | None:
-    """Locate Point C as the strongest change toward the final steep drop.
+    """Locate Point C from a broad, persistent negative-curvature feature.
 
-    The method follows the dashboard logic developed for 3-step cycles:
-    1. take the B -> D segment,
-    2. compute the first derivative,
-    3. compute the change in slope,
-    4. select the most negative interior slope change.
+    Point C is intended to mark the transition into the final ALE-related drop,
+    not simply the sharpest individual step between samples. To reduce the
+    sensitivity of the old raw second-derivative method to abrupt C -> D jumps:
+
+    1. Smooth the B -> D thickness trace with a low-order Savitzky-Golay fit.
+    2. Compute first and second derivatives using the measured time spacing.
+    3. Search the negative second derivative for local peaks.
+    4. Require a minimum peak width so one- or two-sample step artifacts are
+       rejected even when their instantaneous curvature is very large.
+    5. Choose the remaining candidate with the greatest prominence.
+
+    ``polyorder`` is intentionally restricted to 2 or 3. Higher-order local
+    polynomials can follow sharp point-to-point structure and reintroduce the
+    sensitivity this filter is designed to suppress.
     """
-    segment_time = time_values[max_idx : min2_idx + 1]
-    segment_thickness = thickness_values[max_idx : min2_idx + 1]
-
-    if len(segment_time) < 5:
+    if polyorder not in (2, 3):
+        return None
+    if min_width < 1:
         return None
 
-    # np.gradient requires meaningful spacing. Duplicate time points make the
-    # derivative ill-defined, so reject the transition rather than hide it.
-    if np.any(np.diff(segment_time) == 0):
+    segment_time = np.asarray(time_values[max_idx : min2_idx + 1], dtype=float)
+    segment_thickness = np.asarray(
+        thickness_values[max_idx : min2_idx + 1], dtype=float
+    )
+
+    if len(segment_time) < 7:
+        return None
+    if not np.isfinite(segment_time).all() or not np.isfinite(segment_thickness).all():
         return None
 
-    slope = np.gradient(segment_thickness, segment_time)
-    slope_change = np.diff(slope)
-    interior_slope_change = slope_change[1:-1]
-
-    if len(interior_slope_change) == 0 or not np.isfinite(interior_slope_change).any():
+    # Derivatives require strictly increasing time. Duplicate or reversed time
+    # points are rejected rather than silently generating unstable gradients.
+    if np.any(np.diff(segment_time) <= 0):
         return None
 
-    transition_local_idx = int(np.nanargmin(interior_slope_change) + 1)
+    effective_window = _effective_savgol_window(
+        len(segment_time), smoothing_window, polyorder
+    )
+    if effective_window is None:
+        return None
+
+    smoothed_thickness = signal.savgol_filter(
+        segment_thickness,
+        window_length=effective_window,
+        polyorder=polyorder,
+        mode="interp",
+    )
+
+    slope = np.gradient(smoothed_thickness, segment_time)
+    second_derivative = np.gradient(slope, segment_time)
+
+    # Negative second derivative means the downward slope is becoming steeper.
+    # Search its magnitude as a positive peak signal.
+    transition_strength = -second_derivative
+
+    # Savitzky-Golay interpolation is least trustworthy at the window edges, and
+    # B/D themselves are extrema rather than Point C candidates.
+    edge_buffer = max(2, effective_window // 2)
+    if len(transition_strength) <= 2 * edge_buffer + 1:
+        edge_buffer = 1
+
+    interior_strength = transition_strength[edge_buffer:-edge_buffer]
+    if len(interior_strength) < 3 or not np.isfinite(interior_strength).any():
+        return None
+
+    # Width is measured in samples at half prominence. The minimum-width rule is
+    # the main safeguard against a very steep but nearly instantaneous C -> D
+    # step overwhelming a broader process transition.
+    peaks, properties = signal.find_peaks(
+        interior_strength,
+        prominence=0,
+        width=float(min_width),
+    )
+    if len(peaks) == 0:
+        return None
+
+    best_peak = int(peaks[np.argmax(properties["prominences"])])
+    transition_local_idx = edge_buffer + best_peak
     return max_idx + transition_local_idx
 
 
@@ -227,27 +300,21 @@ def calculate_cycles(
     events: pd.DataFrame,
     time_values: np.ndarray,
     thickness_values: np.ndarray,
-    analysis_type: AnalysisType,
     recovered_min_indices: list[int] | None = None,
     recovered_max_indices: list[int] | None = None,
+    transition_smoothing_window: int = 11,
+    transition_polyorder: int = 2,
+    transition_min_width: float = 5.0,
 ) -> CycleAnalysisResult:
-    """Calculate only complete successive MIN -> MAX -> MIN cycles.
+    """Calculate complete ALD/ALE-process MIN -> MAX -> MIN cycles.
 
-    2-step mode:
-      A = first minimum
-      B = maximum
-      D = next minimum
-      Delta 1 = B - A
-      Delta 2 = B - D
-
-    3-step mode:
-      A = first minimum
-      B = maximum
-      C = transition point between B and D
-      D = next minimum
-      Delta 1 = B - A
-      Delta 2 = B - C
-      Delta 3 = C - D
+    A = first minimum
+    B = maximum
+    C = broad transition point between B and D
+    D = next minimum
+    Delta 1 = B - A
+    Delta 2 = B - C
+    Delta 3 = C - D
     """
     recovered_min_set = set(recovered_min_indices or [])
     recovered_max_set = set(recovered_max_indices or [])
@@ -284,33 +351,14 @@ def calculate_cycles(
         thickness_b = float(point_b["Thickness"])
         thickness_d = float(point_d["Thickness"])
 
-        cycle_data = {
-            "Cycle": len(cycles) + 1,
-            "Point A Index": point_a_idx,
-            "Point A Time": float(point_a["Time"]),
-            "Point A Thickness": thickness_a,
-            "Point B Index": point_b_idx,
-            "Point B Time": float(point_b["Time"]),
-            "Point B Thickness": thickness_b,
-            "Point C Index": np.nan,
-            "Point C Time": np.nan,
-            "Point C Thickness": np.nan,
-            "Point D Index": point_d_idx,
-            "Point D Time": float(point_d["Time"]),
-            "Point D Thickness": thickness_d,
-            "Delta 1": thickness_b - thickness_a,
-        }
-
-        if analysis_type == "2-step":
-            cycle_data["Delta 2"] = thickness_b - thickness_d
-            cycles.append(cycle_data)
-            continue
-
         transition_idx = _detect_transition_index(
             time_values=time_values,
             thickness_values=thickness_values,
             max_idx=point_b_idx,
             min2_idx=point_d_idx,
+            smoothing_window=transition_smoothing_window,
+            polyorder=transition_polyorder,
+            min_width=transition_min_width,
         )
 
         if transition_idx is None:
@@ -331,16 +379,26 @@ def calculate_cycles(
         else:
             transition_indices.append(transition_idx)
 
-        cycle_data.update(
+        cycles.append(
             {
+                "Cycle": len(cycles) + 1,
+                "Point A Index": point_a_idx,
+                "Point A Time": float(point_a["Time"]),
+                "Point A Thickness": thickness_a,
+                "Point B Index": point_b_idx,
+                "Point B Time": float(point_b["Time"]),
+                "Point B Thickness": thickness_b,
                 "Point C Index": transition_idx,
                 "Point C Time": transition_time,
                 "Point C Thickness": transition_thickness,
+                "Point D Index": point_d_idx,
+                "Point D Time": float(point_d["Time"]),
+                "Point D Thickness": thickness_d,
+                "Delta 1": thickness_b - thickness_a,
                 "Delta 2": thickness_b - transition_thickness,
                 "Delta 3": transition_thickness - thickness_d,
             }
         )
-        cycles.append(cycle_data)
 
     cycle_df = format_cycle_results(pd.DataFrame(cycles))
 
