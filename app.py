@@ -13,9 +13,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Reload local analysis logic on Streamlit reruns so deployments do not retain an
-# older calculate_cycles() signature in memory.
+# Reload local analysis logic on Streamlit reruns so deployments do not retain
+# an older calculate_cycles() signature in memory.
 import analysis as analysis_core
+
 analysis_core = importlib.reload(analysis_core)
 
 build_events = analysis_core.build_events
@@ -29,15 +30,12 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
 def _normalize_header(value) -> str:
-    """Normalize an Excel/CSV header for loose keyword matching."""
     if pd.isna(value):
         return ""
-    text = str(value).strip().lower()
-    return re.sub(r"\s+", " ", text)
+    return re.sub(r"\s+", " ", str(value).strip().lower())
 
 
 def _is_time_header(value) -> bool:
-    """Recognize common ellipsometer time-column labels."""
     text = _normalize_header(value)
     return (
         "time" in text
@@ -47,7 +45,6 @@ def _is_time_header(value) -> bool:
 
 
 def _is_thickness_header(value) -> bool:
-    """Recognize common thickness-column labels from ellipsometer exports."""
     text = _normalize_header(value)
     return (
         "thickness" in text
@@ -62,7 +59,7 @@ def detect_excel_header_row(
     sheet_name: str,
     scan_rows: int = 30,
 ) -> int | None:
-    """Find a row with separate time and thickness header cells."""
+    """Find a row containing separate time and thickness header cells."""
     preview = pd.read_excel(
         io.BytesIO(file_bytes),
         sheet_name=sheet_name,
@@ -82,14 +79,12 @@ def detect_excel_header_row(
             for col_idx, value in enumerate(row_values)
             if _is_thickness_header(value)
         ]
-
         if any(
             time_idx != thickness_idx
             for time_idx in time_positions
             for thickness_idx in thickness_positions
         ):
             return row_idx
-
     return None
 
 
@@ -133,7 +128,6 @@ def load_csv(file_bytes: bytes) -> pd.DataFrame:
 def prepare_numeric_data(
     df: pd.DataFrame, time_col: str, thickness_col: str
 ) -> pd.DataFrame:
-    """Coerce selected columns to numeric and normalize to forward physical time."""
     cleaned = df[[time_col, thickness_col]].copy()
     cleaned[time_col] = pd.to_numeric(cleaned[time_col], errors="coerce")
     cleaned[thickness_col] = pd.to_numeric(cleaned[thickness_col], errors="coerce")
@@ -242,7 +236,7 @@ def plot_cycle_analysis(
             thickness_values[point_b_indices],
             s=110,
             marker=">",
-            label="Point B (rising transition)",
+            label="Point B (purge plateau entry)",
         )
     if point_c_indices:
         ax.scatter(
@@ -250,7 +244,7 @@ def plot_cycle_analysis(
             thickness_values[point_c_indices],
             s=110,
             marker="^",
-            label="Point C (falling transition)",
+            label="Point C (purge plateau exit)",
         )
     if recovered_point_b_indices:
         ax.scatter(
@@ -287,36 +281,36 @@ sequences in forward physical time.
 
 **A/B/C/D definition**
 - **Point A** = first minimum
-- **Maximum anchor** = detected maximum used only to split the cycle
-- **Point B** = distinct rising-side transition between A and the maximum
-- **Point C** = distinct falling-side transition between the maximum and D
+- **Point B** = entry into the low-slope purge/plateau after the active rise
+- **Maximum anchor** = a reference point inside or at an edge of the purge region
+- **Point C** = exit from the low-slope purge/plateau before the active fall
 - **Point D** = next minimum
 - **Δ1 = B − A**
 - **Δ2 = B − C**
 - **Δ3 = C − D**
 
-A valid cycle must satisfy **A < B < maximum < C < D**. The maximum itself is
-never allowed to become Point B or Point C. If either transition is not resolved,
-the cycle is rejected.
+A valid cycle follows **A < B ≤ maximum ≤ C < D**. The maximum is not forced to
+be a separate process point: it may equal B, C, or both if that is what the
+sampled trace resolves.
 
 **Transition detection**  
-Each side of the maximum is analyzed separately. The thickness trace is lightly
-smoothed, **dh/dt** is calculated, and the algorithm finds the onset of the
-strongest rising regime on A → maximum and the strongest falling regime on
-maximum → D.
+The program lightly smooths A → D, calculates the slope between adjacent samples,
+and uses the active rise before the maximum and active fall after it as reference
+rates. Starting at the maximum, it expands left and right through the contiguous
+**low-slope region**. Those two edges are B and C.
+
+This is meant to capture the purge step even when it has a slight positive or
+negative drift instead of a perfectly flat plateau.
 
 **Smoothing window**  
 The minimum is **3 samples** so short ellipsometry transitions are not
 unnecessarily smeared.
 
-**Transition threshold**  
-Lower percentages detect an earlier/more sensitive onset. Higher percentages put
-the transition closer to the strongest slope.
-
-**Persistence**  
-The slope must remain in the transition regime for at least this many connected
-samples. If a transition is not distinct enough to satisfy the rule, that cycle
-is excluded.
+**Purge plateau threshold**  
+This is the largest slope magnitude that can still count as part of the purge
+plateau, expressed as a percentage of the active rise/fall rate. Lower values
+require a flatter purge. Higher values allow more gradual drift and produce a
+wider B → C region.
 
 **Time direction**  
 Uploaded data are automatically sorted by the selected time column before
@@ -338,8 +332,8 @@ extrema.
 st.set_page_config(page_title="Thickness Cycle Delta Analyzer", layout="wide")
 st.title("Thickness Cycle Delta Analyzer")
 st.write(
-    "Analyze cyclic thickness-vs-time data for the ALD/ALE process with "
-    "minimum/maximum anchors, two transition points, and Δ1/Δ2/Δ3 calculations."
+    "Analyze cyclic thickness-vs-time data for the ALD/ALE process using "
+    "minimum/maximum anchors, purge plateau boundaries, and Δ1/Δ2/Δ3 calculations."
 )
 show_interpretation_guide()
 
@@ -440,7 +434,7 @@ max_allowed_order = max(1, min(250, (len(full_df) - 1) // 2))
 default_order = min(10, max_allowed_order)
 
 st.sidebar.header("ALD/ALE Process")
-st.sidebar.caption("A → B → max anchor → C → D")
+st.sidebar.caption("A → B → purge/max anchor → C → D")
 st.sidebar.caption("Δ1 = B − A, Δ2 = B − C, Δ3 = C − D")
 
 st.sidebar.header("Extrema filters")
@@ -457,7 +451,7 @@ if min_order > window_max_order or max_order > window_max_order:
         "The selected extrema order is large relative to the current analysis window."
     )
 
-st.sidebar.header("Transition detection")
+st.sidebar.header("Purge plateau detection")
 max_transition_window = min(51, max(3, len(analysis_df)))
 if max_transition_window % 2 == 0:
     max_transition_window -= 1
@@ -469,30 +463,21 @@ transition_smoothing_window = st.sidebar.slider(
     max_value=max_transition_window,
     value=3,
     step=2,
-    help="Light smoothing before dh/dt is calculated.",
+    help="Light smoothing before interval slopes are calculated.",
 )
 
-onset_percent = st.sidebar.slider(
-    "Transition threshold (% of slope change)",
+plateau_percent = st.sidebar.slider(
+    "Purge plateau threshold (% of active slope)",
     min_value=10,
     max_value=80,
     value=35,
     step=5,
     help=(
-        "Lower values place B/C earlier at the first departure from the local "
-        "baseline. Higher values place them closer to the strongest slope."
+        "Lower values require a flatter purge region. Higher values allow more "
+        "positive/negative drift and widen the B-to-C plateau region."
     ),
 )
-transition_onset_fraction = onset_percent / 100.0
-
-transition_persistence = st.sidebar.slider(
-    "Transition persistence (samples)",
-    min_value=1,
-    max_value=5,
-    value=2,
-    step=1,
-    help="Minimum connected transition-regime samples required for B or C.",
-)
+transition_onset_fraction = plateau_percent / 100.0
 
 min_indices, max_indices = detect_extrema(thickness_values, min_order, max_order)
 primary_events = build_events(min_indices, max_indices, time_values, thickness_values)
@@ -559,8 +544,6 @@ if "transition_smoothing_window" in cycle_parameters:
     calculate_kwargs["transition_smoothing_window"] = transition_smoothing_window
 if "transition_onset_fraction" in cycle_parameters:
     calculate_kwargs["transition_onset_fraction"] = transition_onset_fraction
-if "transition_persistence" in cycle_parameters:
-    calculate_kwargs["transition_persistence"] = transition_persistence
 if "transition_polyorder" in cycle_parameters:
     calculate_kwargs["transition_polyorder"] = 2
 if (
@@ -607,18 +590,16 @@ row2 = st.columns(4)
 row2[0].metric("Detected minima", len(min_indices))
 row2[1].metric("Maximum anchors", len(max_indices))
 row2[2].metric("Rejected sequences", result.rejected_sequences)
-row2[3].metric("Transition failures", result.derivative_failures)
+row2[3].metric("Plateau failures", result.derivative_failures)
 
 if len(cycle_df) > 0:
     st.success(
-        f"{len(cycle_df)} complete cycles with distinct B and C transitions were "
-        "identified."
+        f"{len(cycle_df)} complete cycles with purge plateau boundaries were identified."
     )
 else:
     st.warning(
-        "No complete cycles with distinct B and C transitions were detected. "
-        "Adjust the analysis window, extrema orders, transition threshold, "
-        "persistence, or smoothing window."
+        "No complete cycles with valid purge plateau boundaries were detected. "
+        "Adjust the analysis window, extrema orders, plateau threshold, or smoothing."
     )
 
 st.subheader("Δ1, Δ2, and Δ3 by cycle")
