@@ -42,6 +42,18 @@ Because plateau membership is based on **slope magnitude**, the purge region may
 
 The Savitzky-Golay polynomial order is fixed internally at 2 in the dashboard.
 
+## Individual cycle inspector
+
+For long processes, the dashboard includes a second **Inspect Individual Cycle** graph below the main cycle plot.
+
+- Select any accepted cycle by cycle number.
+- The graph zooms to that cycle only, with optional padding before A and after D.
+- The exact stored **A, B, maximum anchor M, C, and D** are marked and labeled.
+- The detected B → C purge region is shaded when it has nonzero width.
+- A small table lists each selected point's analysis index, time, and thickness.
+
+The inspector does not re-run the detector. It visualizes the exact points already used to calculate Δ1, Δ2, and Δ3.
+
 ## Time direction
 
 The uploaded file may be ordered with time increasing or decreasing. The dashboard automatically sorts the selected time column into **ascending chronological order before any extrema or transition calculations**.
@@ -97,7 +109,8 @@ python -m streamlit run app.py
 4. Start with smoothing = 3 and purge plateau threshold = 35%.
 5. If B/C are too close to the maximum, increase the plateau threshold.
 6. If the purge region becomes too wide, lower the plateau threshold.
-7. Visually inspect B and C and download the CSV when satisfied.
+7. Use **Inspect Individual Cycle** to verify A/B/M/C/D on representative cycles, especially for long datasets.
+8. Download the CSV when satisfied.
 
 ## Output columns
 
@@ -105,16 +118,17 @@ python -m streamlit run app.py
 Cycle,
 Point A Index, Point A Time, Point A Thickness,
 Point B Index, Point B Time, Point B Thickness,
+Max Anchor Index, Max Anchor Time, Max Anchor Thickness,
 Point C Index, Point C Time, Point C Thickness,
 Point D Index, Point D Time, Point D Thickness,
 Delta 1, Delta 2, Delta 3
 ```
 
-The maximum anchor is shown on the plot but is not added to the exported A/B/C/D columns.
+The maximum anchor is stored in the cycle results so the individual-cycle inspector always shows the exact maximum used for that cycle.
 
 ## Testing
 
-The test suite verifies plateau-entry/exit detection, slight purge drift, maximum-as-transition behavior, and Δ1/Δ2/Δ3 arithmetic.
+The test suite verifies plateau-entry/exit detection, slight purge drift, maximum-as-transition behavior, stored maximum-anchor metadata, and Δ1/Δ2/Δ3 arithmetic.
 
 Run:
 
