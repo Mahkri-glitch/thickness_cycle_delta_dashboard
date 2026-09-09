@@ -16,6 +16,9 @@ OUTPUT_COLUMNS = [
     "Point B Index",
     "Point B Time",
     "Point B Thickness",
+    "Max Anchor Index",
+    "Max Anchor Time",
+    "Max Anchor Thickness",
     "Point C Index",
     "Point C Time",
     "Point C Thickness",
@@ -450,6 +453,7 @@ def calculate_cycles(
 
         thickness_a = float(thickness_values[point_a_idx])
         thickness_b = float(thickness_values[point_b_idx])
+        thickness_max = float(thickness_values[max_anchor_idx])
         thickness_c = float(thickness_values[point_c_idx])
         thickness_d = float(thickness_values[point_d_idx])
 
@@ -474,6 +478,9 @@ def calculate_cycles(
                 "Point B Index": point_b_idx,
                 "Point B Time": float(time_values[point_b_idx]),
                 "Point B Thickness": thickness_b,
+                "Max Anchor Index": max_anchor_idx,
+                "Max Anchor Time": float(time_values[max_anchor_idx]),
+                "Max Anchor Thickness": thickness_max,
                 "Point C Index": point_c_idx,
                 "Point C Time": float(time_values[point_c_idx]),
                 "Point C Thickness": thickness_c,
