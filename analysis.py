@@ -124,6 +124,84 @@ def find_suspect_regions(events: pd.DataFrame) -> list[dict]:
     return suspects
 
 
+def _flat_aware_local_extrema_candidates(
+    local_thickness: np.ndarray,
+    order: int,
+    missing_type: str,
+) -> np.ndarray:
+    """Find sharp or flat extrema for local missing-point recovery only.
+
+    The global detector intentionally remains strict. Recovery uses an inclusive
+    comparator so a flat top/bottom can be considered, then collapses each
+    contiguous candidate run to one representative point. A run is accepted only
+    when the entire extremal level is strictly bounded by the opposite direction
+    on both sides, preventing a flat shoulder on a monotonic slope from being
+    mistaken for an extremum.
+    """
+    values = np.asarray(local_thickness, dtype=float)
+    if len(values) < 3 or order < 1 or missing_type not in {"min", "max"}:
+        return np.asarray([], dtype=int)
+
+    comparator = np.less_equal if missing_type == "min" else np.greater_equal
+    inclusive_candidates = signal.argrelextrema(
+        values,
+        comparator=comparator,
+        order=int(order),
+    )[0].astype(int)
+    if len(inclusive_candidates) == 0:
+        return np.asarray([], dtype=int)
+
+    groups: list[tuple[int, int]] = []
+    group_start = int(inclusive_candidates[0])
+    group_end = group_start
+    for candidate in inclusive_candidates[1:]:
+        candidate = int(candidate)
+        if candidate == group_end + 1:
+            group_end = candidate
+        else:
+            groups.append((group_start, group_end))
+            group_start = candidate
+            group_end = candidate
+    groups.append((group_start, group_end))
+
+    representatives: list[int] = []
+    for start_idx, end_idx in groups:
+        if start_idx <= 0 or end_idx >= len(values) - 1:
+            continue
+
+        left_values = values[max(0, start_idx - order) : start_idx]
+        right_values = values[
+            end_idx + 1 : min(len(values), end_idx + 1 + order)
+        ]
+        if len(left_values) == 0 or len(right_values) == 0:
+            continue
+
+        group_values = values[start_idx : end_idx + 1]
+        if missing_type == "min":
+            extreme_value = float(np.min(group_values))
+            is_true_extremum = bool(
+                np.all(left_values > extreme_value)
+                and np.all(right_values > extreme_value)
+            )
+        else:
+            extreme_value = float(np.max(group_values))
+            is_true_extremum = bool(
+                np.all(left_values < extreme_value)
+                and np.all(right_values < extreme_value)
+            )
+
+        if not is_true_extremum:
+            continue
+
+        tied_positions = np.flatnonzero(group_values == extreme_value)
+        if len(tied_positions) == 0:
+            continue
+        representative_offset = int(tied_positions[(len(tied_positions) - 1) // 2])
+        representatives.append(start_idx + representative_offset)
+
+    return np.asarray(representatives, dtype=int)
+
+
 def recover_missing_extremum(
     thickness_values: np.ndarray,
     min_indices: np.ndarray,
@@ -131,40 +209,41 @@ def recover_missing_extremum(
     issue: dict,
     recovery_order: int,
 ) -> RecoveryResult:
-    """Recover one missing extremum inside a suspicious same-type gap."""
+    """Recover one missing extremum, including a flat local top or bottom."""
     updated_mins = np.asarray(min_indices, dtype=int).copy()
     updated_maxs = np.asarray(max_indices, dtype=int).copy()
     recovered_mins: list[int] = []
     recovered_maxs: list[int] = []
 
-    missing_type = issue["Missing Type"]
+    missing_type = str(issue["Missing Type"])
     region_start = int(issue["Start Index"])
     region_end = int(issue["End Index"])
 
     padding = max(recovery_order * 2, 5)
     padded_start = max(0, region_start - padding)
     padded_end = min(len(thickness_values) - 1, region_end + padding)
-    local_thickness = thickness_values[padded_start : padded_end + 1]
+    local_thickness = np.asarray(
+        thickness_values[padded_start : padded_end + 1], dtype=float
+    )
 
     local_max_order = max(1, (len(local_thickness) - 1) // 2)
-    effective_order = min(recovery_order, local_max_order)
+    effective_order = min(int(recovery_order), local_max_order)
+    local_candidates = _flat_aware_local_extrema_candidates(
+        local_thickness=local_thickness,
+        order=effective_order,
+        missing_type=missing_type,
+    )
+    candidates = local_candidates + padded_start
+    candidates = candidates[(candidates > region_start) & (candidates < region_end)]
 
-    if missing_type == "min":
-        candidates = signal.argrelmin(local_thickness, order=effective_order)[0]
-        candidates = candidates + padded_start
-        candidates = candidates[(candidates > region_start) & (candidates < region_end)]
-        if len(candidates) > 0:
-            recovered_idx = int(candidates[np.argmin(thickness_values[candidates])])
-            updated_mins = np.unique(np.append(updated_mins, recovered_idx)).astype(int)
-            recovered_mins.append(recovered_idx)
-    else:
-        candidates = signal.argrelmax(local_thickness, order=effective_order)[0]
-        candidates = candidates + padded_start
-        candidates = candidates[(candidates > region_start) & (candidates < region_end)]
-        if len(candidates) > 0:
-            recovered_idx = int(candidates[np.argmax(thickness_values[candidates])])
-            updated_maxs = np.unique(np.append(updated_maxs, recovered_idx)).astype(int)
-            recovered_maxs.append(recovered_idx)
+    if len(candidates) > 0 and missing_type == "min":
+        recovered_idx = int(candidates[np.argmin(thickness_values[candidates])])
+        updated_mins = np.unique(np.append(updated_mins, recovered_idx)).astype(int)
+        recovered_mins.append(recovered_idx)
+    elif len(candidates) > 0 and missing_type == "max":
+        recovered_idx = int(candidates[np.argmax(thickness_values[candidates])])
+        updated_maxs = np.unique(np.append(updated_maxs, recovered_idx)).astype(int)
+        recovered_maxs.append(recovered_idx)
 
     return RecoveryResult(
         min_indices=updated_mins,
@@ -295,7 +374,6 @@ def _detect_plateau_transition_indices(
     if len(positive_rise) == 0 or len(negative_fall) == 0:
         return None
 
-    # A percentile is less sensitive to one noisy derivative spike than max().
     rise_reference = float(np.nanpercentile(positive_rise, 75))
     fall_reference = float(np.nanpercentile(negative_fall, 75))
     if (
@@ -309,7 +387,6 @@ def _detect_plateau_transition_indices(
     rise_plateau_limit = float(plateau_fraction) * rise_reference
     fall_plateau_limit = float(plateau_fraction) * fall_reference
 
-    # B: walk left from the maximum through the low-slope purge region.
     left_interval_idx = max_local_idx - 1
     while (
         left_interval_idx >= 0
@@ -318,7 +395,6 @@ def _detect_plateau_transition_indices(
         left_interval_idx -= 1
     point_b_local_idx = left_interval_idx + 1
 
-    # C: sustained fall OR one clearly instantaneous drop.
     point_c_local_idx = _find_fall_onset_interval(
         slopes=interval_slopes,
         plateau_limit=fall_plateau_limit,
@@ -328,7 +404,6 @@ def _detect_plateau_transition_indices(
     if point_c_local_idx is None:
         return None
 
-    # B must come after A and there must be a real positive-rise regime before B.
     if point_b_local_idx <= 0:
         return None
     if not np.any(left_slopes[:point_b_local_idx] > rise_plateau_limit):
