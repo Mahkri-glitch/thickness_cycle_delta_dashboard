@@ -78,6 +78,40 @@ def test_slight_positive_or_negative_purge_drift_is_allowed():
     assert c >= 7
 
 
+def test_isolated_downward_excursion_during_purge_does_not_end_c():
+    time = np.arange(13, dtype=float)
+    thickness = np.array(
+        [
+            0.0,
+            1.0,
+            2.0,
+            3.0,
+            3.05,
+            3.03,
+            2.70,  # isolated downward excursion
+            2.69,
+            2.68,
+            2.00,  # sustained fall starts here
+            1.20,
+            0.40,
+            0.00,
+        ],
+        dtype=float,
+    )
+
+    transitions = _detect_plateau_transition_indices(
+        time,
+        thickness,
+        min1_idx=0,
+        max_idx=4,
+        min2_idx=12,
+        smoothing_window=3,
+        plateau_fraction=0.35,
+    )
+
+    assert transitions == (3, 8)
+
+
 def test_maximum_can_be_b_and_c_when_no_plateau_is_resolved():
     time = np.arange(7, dtype=float)
     thickness = np.array([0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 0.0], dtype=float)
@@ -95,7 +129,7 @@ def test_maximum_can_be_b_and_c_when_no_plateau_is_resolved():
     assert transitions == (3, 3)
 
 
-def test_falling_wrapper_finds_right_plateau_edge():
+def test_falling_wrapper_finds_sustained_fall_start():
     time = np.arange(8, dtype=float)
     thickness = np.array([3.0, 3.02, 3.01, 3.00, 2.95, 2.0, 1.0, 0.0])
 
