@@ -193,6 +193,43 @@ def _effective_savgol_window(
     return window
 
 
+def _find_fall_onset_interval(
+    slopes: np.ndarray,
+    plateau_limit: float,
+    fall_reference: float,
+    start_idx: int = 0,
+) -> int | None:
+    """Return the first sustained or clearly instantaneous active-fall interval.
+
+    A normal fall needs two consecutive intervals below the plateau threshold.
+    A single interval can also define the onset when its magnitude reaches the
+    representative active-fall rate. To avoid accepting an obvious spike/rebound,
+    that single-drop path is rejected when the next interval rebounds upward with
+    comparable magnitude.
+    """
+    for interval_idx in range(int(start_idx), len(slopes)):
+        current_slope = float(slopes[interval_idx])
+
+        sustained_fall = (
+            interval_idx + 1 < len(slopes)
+            and current_slope < -plateau_limit
+            and slopes[interval_idx + 1] < -plateau_limit
+        )
+
+        exceptional_single_drop = current_slope <= -fall_reference
+        strong_immediate_rebound = (
+            interval_idx + 1 < len(slopes)
+            and slopes[interval_idx + 1] >= fall_reference
+        )
+
+        if sustained_fall or (
+            exceptional_single_drop and not strong_immediate_rebound
+        ):
+            return interval_idx
+
+    return None
+
+
 def _detect_plateau_transition_indices(
     time_values: np.ndarray,
     thickness_values: np.ndarray,
@@ -207,13 +244,14 @@ def _detect_plateau_transition_indices(
 
     B is the left edge of the low-slope purge region after the active rise.
 
-    C is defined differently on purpose: starting at the maximum, the detector
-    looks for the first point where the active negative fall is sustained for two
-    consecutive intervals. A single noisy downward interval during purge is
-    therefore ignored instead of ending the purge early.
+    C is asymmetric on purpose. Starting at the maximum, the detector accepts
+    either (1) the first two-interval sustained negative fall or (2) one clearly
+    instantaneous drop whose magnitude reaches the representative active-fall
+    rate and is not immediately reversed by a comparably strong rebound.
 
-    Small positive or negative drift during purge is allowed. If the trace changes
-    directly from rise to a sustained fall, B and C may both equal the maximum.
+    This preserves a true one-sample reaction while ignoring ordinary isolated
+    downward excursions during purge. If the trace changes directly from rise to
+    a real fall, B and C may both equal the maximum.
     """
     if not (0.01 <= float(plateau_fraction) <= 0.95):
         return None
@@ -254,7 +292,7 @@ def _detect_plateau_transition_indices(
 
     positive_rise = left_slopes[left_slopes > 0]
     negative_fall = -right_slopes[right_slopes < 0]
-    if len(positive_rise) == 0 or len(negative_fall) < 2:
+    if len(positive_rise) == 0 or len(negative_fall) == 0:
         return None
 
     # A percentile is less sensitive to one noisy derivative spike than max().
@@ -280,17 +318,13 @@ def _detect_plateau_transition_indices(
         left_interval_idx -= 1
     point_b_local_idx = left_interval_idx + 1
 
-    # C: ignore isolated downward excursions and require two consecutive
-    # active-fall intervals. The point at the start of that run is Point C.
-    point_c_local_idx: int | None = None
-    for right_interval_idx in range(max_local_idx, len(interval_slopes) - 1):
-        if (
-            interval_slopes[right_interval_idx] < -fall_plateau_limit
-            and interval_slopes[right_interval_idx + 1] < -fall_plateau_limit
-        ):
-            point_c_local_idx = right_interval_idx
-            break
-
+    # C: sustained fall OR one clearly instantaneous drop.
+    point_c_local_idx = _find_fall_onset_interval(
+        slopes=interval_slopes,
+        plateau_limit=fall_plateau_limit,
+        fall_reference=fall_reference,
+        start_idx=max_local_idx,
+    )
     if point_c_local_idx is None:
         return None
 
@@ -336,7 +370,7 @@ def _detect_transition_index(
     segment_thickness = np.asarray(
         thickness_values[max_idx : min2_idx + 1], dtype=float
     )
-    if len(segment_time) < 3 or np.any(np.diff(segment_time) <= 0):
+    if len(segment_time) < 2 or np.any(np.diff(segment_time) <= 0):
         return None
 
     effective_window = _effective_savgol_window(
@@ -353,20 +387,21 @@ def _detect_transition_index(
     )
     slopes = np.diff(smoothed) / np.diff(segment_time)
     negative_fall = -slopes[slopes < 0]
-    if len(negative_fall) < 2:
+    if len(negative_fall) == 0:
         return None
 
     fall_reference = float(np.nanpercentile(negative_fall, 75))
     plateau_limit = float(onset_fraction) * fall_reference
 
-    for interval_idx in range(0, len(slopes) - 1):
-        if (
-            slopes[interval_idx] < -plateau_limit
-            and slopes[interval_idx + 1] < -plateau_limit
-        ):
-            return max_idx + interval_idx
-
-    return None
+    interval_idx = _find_fall_onset_interval(
+        slopes=slopes,
+        plateau_limit=plateau_limit,
+        fall_reference=fall_reference,
+        start_idx=0,
+    )
+    if interval_idx is None:
+        return None
+    return max_idx + interval_idx
 
 
 def calculate_cycles(
@@ -381,14 +416,14 @@ def calculate_cycles(
     transition_polyorder: int = 2,
     transition_min_width: float | None = None,
 ) -> CycleAnalysisResult:
-    """Calculate max-anchored cycles using purge entry B and sustained-fall C.
+    """Calculate max-anchored cycles using purge entry B and fall-onset C.
 
     A and D are successive minima. The detected maximum anchors the purge region:
       - B = left edge of the low-slope plateau after the active rise
-      - C = first point of two consecutive active negative-fall intervals
+      - C = first sustained active fall, or one clearly instantaneous strong drop
 
     The maximum may equal B, C, or both. A cycle is rejected when a meaningful
-    rise or sustained fall cannot be resolved.
+    rise or fall cannot be resolved.
     """
     del transition_persistence, transition_min_width
 
