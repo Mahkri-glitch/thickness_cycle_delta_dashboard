@@ -9,6 +9,7 @@ from analysis import (
     calculate_cycles,
     find_suspect_regions,
     format_cycle_results,
+    recover_missing_extremum,
 )
 
 
@@ -32,6 +33,51 @@ def test_find_suspect_regions_detects_missing_minimum():
     suspects = find_suspect_regions(events)
     assert len(suspects) == 1
     assert suspects[0]["Missing Type"] == "min"
+
+
+def test_missing_point_recovery_accepts_flat_minimum():
+    thickness = np.array([3.0, 2.0, 1.0, 1.0, 1.0, 2.0, 3.0])
+    issue = {"Missing Type": "min", "Start Index": 0, "End Index": 6}
+
+    recovery = recover_missing_extremum(
+        thickness_values=thickness,
+        min_indices=np.array([], dtype=int),
+        max_indices=np.array([0, 6], dtype=int),
+        issue=issue,
+        recovery_order=1,
+    )
+
+    assert recovery.recovered_min_indices == [3]
+
+
+def test_missing_point_recovery_accepts_flat_maximum():
+    thickness = np.array([0.0, 1.0, 2.0, 2.0, 2.0, 1.0, 0.0])
+    issue = {"Missing Type": "max", "Start Index": 0, "End Index": 6}
+
+    recovery = recover_missing_extremum(
+        thickness_values=thickness,
+        min_indices=np.array([0, 6], dtype=int),
+        max_indices=np.array([], dtype=int),
+        issue=issue,
+        recovery_order=1,
+    )
+
+    assert recovery.recovered_max_indices == [3]
+
+
+def test_missing_point_recovery_rejects_flat_shoulder():
+    thickness = np.array([5.0, 4.0, 4.0, 3.0, 2.0, 1.0, 0.0])
+    issue = {"Missing Type": "min", "Start Index": 0, "End Index": 6}
+
+    recovery = recover_missing_extremum(
+        thickness_values=thickness,
+        min_indices=np.array([], dtype=int),
+        max_indices=np.array([0, 6], dtype=int),
+        issue=issue,
+        recovery_order=1,
+    )
+
+    assert recovery.recovered_min_indices == []
 
 
 def test_plateau_edges_are_second_transition_after_minimum_and_before_fall():
@@ -88,10 +134,10 @@ def test_isolated_downward_excursion_during_purge_does_not_end_c():
             3.0,
             3.05,
             3.03,
-            2.70,  # isolated downward excursion
+            2.70,
             2.69,
             2.68,
-            2.00,  # sustained fall starts here
+            2.00,
             1.20,
             0.40,
             0.00,
@@ -115,18 +161,7 @@ def test_isolated_downward_excursion_during_purge_does_not_end_c():
 def test_single_strong_drop_can_define_point_c():
     time = np.arange(10, dtype=float)
     thickness = np.array(
-        [
-            0.0,
-            1.0,
-            2.0,
-            3.0,
-            3.05,
-            3.04,
-            3.03,
-            1.00,  # true one-interval drop starts at index 6
-            1.00,
-            0.90,
-        ],
+        [0.0, 1.0, 2.0, 3.0, 3.05, 3.04, 3.03, 1.00, 1.00, 0.90],
         dtype=float,
     )
 
