@@ -100,6 +100,37 @@ def test_plateau_edges_are_second_transition_after_minimum_and_before_fall():
     assert transitions == (3, 6)
 
 
+def test_point_b_uses_last_two_sided_rise_to_purge_boundary():
+    time = np.arange(10, dtype=float)
+    thickness = np.array(
+        [
+            0.0,
+            1.0,
+            2.0,
+            2.2,  # early low-slope interval creates a premature candidate
+            2.8,  # rise resumes
+            2.9,  # later cleaner rise -> purge boundary is at index 4
+            2.92,
+            1.92,
+            0.92,
+            -0.08,
+        ],
+        dtype=float,
+    )
+
+    transitions = _detect_plateau_transition_indices(
+        time,
+        thickness,
+        min1_idx=0,
+        max_idx=6,
+        min2_idx=9,
+        smoothing_window=3,
+        plateau_fraction=0.35,
+    )
+
+    assert transitions == (4, 6)
+
+
 def test_slight_positive_or_negative_purge_drift_is_allowed():
     time = np.arange(13, dtype=float)
     thickness = np.array(
@@ -158,7 +189,7 @@ def test_isolated_downward_excursion_during_purge_does_not_end_c():
     assert transitions == (3, 8)
 
 
-def test_single_strong_drop_can_define_point_c():
+def test_single_strong_drop_can_define_point_c_without_later_drift():
     time = np.arange(10, dtype=float)
     thickness = np.array(
         [0.0, 1.0, 2.0, 3.0, 3.05, 3.04, 3.03, 1.00, 1.00, 0.90],
