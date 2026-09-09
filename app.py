@@ -62,7 +62,12 @@ def detect_excel_header_row(
     sheet_name: str,
     scan_rows: int = 30,
 ) -> int | None:
-    """Find the first row containing both a time-like and thickness-like header."""
+    """Find a row with separate time and thickness header cells.
+
+    A title such as ``Thickness vs Time`` in one cell is intentionally ignored.
+    The real table header must contain a time-like header and a thickness-like
+    header in two different column positions on the same row.
+    """
     preview = pd.read_excel(
         io.BytesIO(file_bytes),
         sheet_name=sheet_name,
@@ -72,9 +77,20 @@ def detect_excel_header_row(
 
     for row_idx in range(len(preview)):
         row_values = preview.iloc[row_idx].tolist()
-        has_time = any(_is_time_header(value) for value in row_values)
-        has_thickness = any(_is_thickness_header(value) for value in row_values)
-        if has_time and has_thickness:
+        time_positions = [
+            col_idx for col_idx, value in enumerate(row_values)
+            if _is_time_header(value)
+        ]
+        thickness_positions = [
+            col_idx for col_idx, value in enumerate(row_values)
+            if _is_thickness_header(value)
+        ]
+
+        if any(
+            time_idx != thickness_idx
+            for time_idx in time_positions
+            for thickness_idx in thickness_positions
+        ):
             return row_idx
 
     return None
@@ -302,8 +318,9 @@ sorted analysis window, not necessarily the original Excel row number.
 
 **Ellipsometer Excel headers**  
 For Excel files, the dashboard scans the first 30 rows for a row containing both
-a time-like header and a thickness-like header. This allows direct ellipsometer
-exports with metadata above the table (for example, headers on Excel row 3).
+a time-like header and a thickness-like header in separate cells. A title such
+as **Thickness vs Time** in one cell is ignored, so the next row containing the
+actual **Time** and **Thickness** columns is used as the table header.
 
 **Extrema order**  
 The minimum and maximum filter orders control how many neighboring points a
@@ -349,7 +366,7 @@ if detected_header_row is not None and detected_header_row > 0:
     )
 elif uploaded_file.name.lower().endswith((".xlsx", ".xls")) and detected_header_row is None:
     st.warning(
-        "Could not automatically identify a row containing both time and thickness "
+        "Could not automatically identify a row containing separate time and thickness "
         "headers in the first 30 rows. The first row was used as the header; "
         "verify the column selections below."
     )
