@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import io
+import re
 import warnings
 
 import matplotlib.pyplot as plt
@@ -27,14 +28,91 @@ recover_missing_extremum = analysis_core.recover_missing_extremum
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
+def _normalize_header(value) -> str:
+    """Normalize an Excel/CSV header for loose keyword matching."""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip().lower()
+    return re.sub(r"\s+", " ", text)
+
+
+def _is_time_header(value) -> bool:
+    """Recognize common ellipsometer time-column labels."""
+    text = _normalize_header(value)
+    return (
+        "time" in text
+        or text in {"t", "seconds", "second", "sec", "secs"}
+        or text.startswith("elapsed")
+    )
+
+
+def _is_thickness_header(value) -> bool:
+    """Recognize common thickness-column labels from ellipsometer exports."""
+    text = _normalize_header(value)
+    return (
+        "thickness" in text
+        or "thick" in text
+        or "thk" in text
+        or text in {"film thickness", "film_thickness"}
+    )
+
+
+def detect_excel_header_row(
+    file_bytes: bytes,
+    sheet_name: str,
+    scan_rows: int = 30,
+) -> int | None:
+    """Find the first row containing both a time-like and thickness-like header."""
+    preview = pd.read_excel(
+        io.BytesIO(file_bytes),
+        sheet_name=sheet_name,
+        header=None,
+        nrows=scan_rows,
+    )
+
+    for row_idx in range(len(preview)):
+        row_values = preview.iloc[row_idx].tolist()
+        has_time = any(_is_time_header(value) for value in row_values)
+        has_thickness = any(_is_thickness_header(value) for value in row_values)
+        if has_time and has_thickness:
+            return row_idx
+
+    return None
+
+
+def find_default_column_index(columns: list, kind: str) -> int | None:
+    """Return the best matching time or thickness column index."""
+    matcher = _is_time_header if kind == "time" else _is_thickness_header
+    for idx, column in enumerate(columns):
+        if matcher(column):
+            return idx
+    return None
+
+
 @st.cache_data
 def get_excel_sheets(file_bytes: bytes) -> list[str]:
     return pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names
 
 
 @st.cache_data
-def load_excel(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
-    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name)
+def load_excel(file_bytes: bytes, sheet_name: str) -> tuple[pd.DataFrame, int | None]:
+    """Load an Excel sheet after automatically locating its real header row."""
+    header_row = detect_excel_header_row(file_bytes, sheet_name)
+    if header_row is None:
+        # Keep old behavior as a fallback for unusual files.
+        return (
+            pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=0),
+            None,
+        )
+
+    return (
+        pd.read_excel(
+            io.BytesIO(file_bytes),
+            sheet_name=sheet_name,
+            header=header_row,
+        ),
+        header_row,
+    )
 
 
 @st.cache_data
@@ -222,6 +300,11 @@ analysis. This makes ascending- and descending-time exports use the same physica
 definition of A, B, C, and D. Reported point indices refer to this chronologically
 sorted analysis window, not necessarily the original Excel row number.
 
+**Ellipsometer Excel headers**  
+For Excel files, the dashboard scans the first 30 rows for a row containing both
+a time-like header and a thickness-like header. This allows direct ellipsometer
+exports with metadata above the table (for example, headers on Excel row 3).
+
 **Extrema order**  
 The minimum and maximum filter orders control how many neighboring points a
 candidate must beat to count as a local extremum. They are independent of Point
@@ -251,20 +334,39 @@ if uploaded_file is None:
     st.stop()
 
 file_bytes = uploaded_file.getvalue()
+detected_header_row = None
+
 if uploaded_file.name.lower().endswith((".xlsx", ".xls")):
     sheet_name = st.selectbox("Sheet", get_excel_sheets(file_bytes))
-    raw_df = load_excel(file_bytes, sheet_name)
+    raw_df, detected_header_row = load_excel(file_bytes, sheet_name)
 else:
     raw_df = load_csv(file_bytes)
+
+if detected_header_row is not None and detected_header_row > 0:
+    st.info(
+        f"Detected the data headers on Excel row {detected_header_row + 1}; "
+        "rows above it were treated as ellipsometer metadata."
+    )
+elif uploaded_file.name.lower().endswith((".xlsx", ".xls")) and detected_header_row is None:
+    st.warning(
+        "Could not automatically identify a row containing both time and thickness "
+        "headers in the first 30 rows. The first row was used as the header; "
+        "verify the column selections below."
+    )
 
 if len(raw_df.columns) < 2:
     st.error("The file needs at least two columns.")
     st.stop()
 
 columns = list(raw_df.columns)
-default_time = columns.index("Time") if "Time" in columns else 0
+time_match = find_default_column_index(columns, "time")
+thickness_match = find_default_column_index(columns, "thickness")
+
+default_time = time_match if time_match is not None else 0
 default_thickness = (
-    columns.index("Thickness") if "Thickness" in columns else min(1, len(columns) - 1)
+    thickness_match
+    if thickness_match is not None
+    else min(1, len(columns) - 1)
 )
 
 left, right = st.columns(2)
