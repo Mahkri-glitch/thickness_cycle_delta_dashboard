@@ -203,18 +203,17 @@ def _detect_plateau_transition_indices(
     plateau_fraction: float = 0.35,
     polyorder: int = 2,
 ) -> tuple[int, int] | None:
-    """Locate B and C as the two edges of the purge/plateau around the maximum.
+    """Locate B and C around the purge/plateau near the maximum.
 
-    A and D are minima and the detected maximum is only an anchor. The interval
-    slopes are measured after light smoothing. The active rise before the maximum
-    and active fall after it establish reference slope magnitudes. Starting at the
-    maximum, the detector expands left and right through intervals whose absolute
-    slope is small relative to those active slopes.
+    B is the left edge of the low-slope purge region after the active rise.
 
-    B is the left edge of that low-slope plateau and C is the right edge. Small
-    positive or negative drift during purge is therefore allowed. If the trace
-    changes directly from rise to fall with no resolved plateau, B and C may both
-    equal the maximum anchor.
+    C is defined differently on purpose: starting at the maximum, the detector
+    looks for the first point where the active negative fall is sustained for two
+    consecutive intervals. A single noisy downward interval during purge is
+    therefore ignored instead of ending the purge early.
+
+    Small positive or negative drift during purge is allowed. If the trace changes
+    directly from rise to a sustained fall, B and C may both equal the maximum.
     """
     if not (0.01 <= float(plateau_fraction) <= 0.95):
         return None
@@ -255,7 +254,7 @@ def _detect_plateau_transition_indices(
 
     positive_rise = left_slopes[left_slopes > 0]
     negative_fall = -right_slopes[right_slopes < 0]
-    if len(positive_rise) == 0 or len(negative_fall) == 0:
+    if len(positive_rise) == 0 or len(negative_fall) < 2:
         return None
 
     # A percentile is less sensitive to one noisy derivative spike than max().
@@ -272,7 +271,7 @@ def _detect_plateau_transition_indices(
     rise_plateau_limit = float(plateau_fraction) * rise_reference
     fall_plateau_limit = float(plateau_fraction) * fall_reference
 
-    # Walk left from the maximum through the low-slope purge region.
+    # B: walk left from the maximum through the low-slope purge region.
     left_interval_idx = max_local_idx - 1
     while (
         left_interval_idx >= 0
@@ -281,25 +280,24 @@ def _detect_plateau_transition_indices(
         left_interval_idx -= 1
     point_b_local_idx = left_interval_idx + 1
 
-    # Walk right from the maximum through the low-slope purge region.
-    right_interval_idx = max_local_idx
-    while (
-        right_interval_idx < len(interval_slopes)
-        and abs(interval_slopes[right_interval_idx]) <= fall_plateau_limit
-    ):
-        right_interval_idx += 1
-    point_c_local_idx = right_interval_idx
+    # C: ignore isolated downward excursions and require two consecutive
+    # active-fall intervals. The point at the start of that run is Point C.
+    point_c_local_idx: int | None = None
+    for right_interval_idx in range(max_local_idx, len(interval_slopes) - 1):
+        if (
+            interval_slopes[right_interval_idx] < -fall_plateau_limit
+            and interval_slopes[right_interval_idx + 1] < -fall_plateau_limit
+        ):
+            point_c_local_idx = right_interval_idx
+            break
+
+    if point_c_local_idx is None:
+        return None
 
     # B must come after A and there must be a real positive-rise regime before B.
     if point_b_local_idx <= 0:
         return None
     if not np.any(left_slopes[:point_b_local_idx] > rise_plateau_limit):
-        return None
-
-    # C must come before D and there must be a real negative-fall regime after C.
-    if point_c_local_idx >= len(segment_time) - 1:
-        return None
-    if not np.any(interval_slopes[point_c_local_idx:] < -fall_plateau_limit):
         return None
 
     if not (
@@ -338,7 +336,7 @@ def _detect_transition_index(
     segment_thickness = np.asarray(
         thickness_values[max_idx : min2_idx + 1], dtype=float
     )
-    if len(segment_time) < 2 or np.any(np.diff(segment_time) <= 0):
+    if len(segment_time) < 3 or np.any(np.diff(segment_time) <= 0):
         return None
 
     effective_window = _effective_savgol_window(
@@ -355,19 +353,20 @@ def _detect_transition_index(
     )
     slopes = np.diff(smoothed) / np.diff(segment_time)
     negative_fall = -slopes[slopes < 0]
-    if len(negative_fall) == 0:
+    if len(negative_fall) < 2:
         return None
 
     fall_reference = float(np.nanpercentile(negative_fall, 75))
     plateau_limit = float(onset_fraction) * fall_reference
 
-    interval_idx = 0
-    while interval_idx < len(slopes) and abs(slopes[interval_idx]) <= plateau_limit:
-        interval_idx += 1
+    for interval_idx in range(0, len(slopes) - 1):
+        if (
+            slopes[interval_idx] < -plateau_limit
+            and slopes[interval_idx + 1] < -plateau_limit
+        ):
+            return max_idx + interval_idx
 
-    if interval_idx >= len(slopes):
-        return None
-    return max_idx + interval_idx
+    return None
 
 
 def calculate_cycles(
@@ -382,15 +381,14 @@ def calculate_cycles(
     transition_polyorder: int = 2,
     transition_min_width: float | None = None,
 ) -> CycleAnalysisResult:
-    """Calculate max-anchored cycles using the two edges of the purge plateau.
+    """Calculate max-anchored cycles using purge entry B and sustained-fall C.
 
-    A and D are successive minima. The detected maximum anchors the low-slope
-    purge/plateau region:
-      - B = left edge of the plateau after the active rise
-      - C = right edge of the plateau before the active fall
+    A and D are successive minima. The detected maximum anchors the purge region:
+      - B = left edge of the low-slope plateau after the active rise
+      - C = first point of two consecutive active negative-fall intervals
 
     The maximum may equal B, C, or both. A cycle is rejected when a meaningful
-    rise, plateau boundary, or fall cannot be resolved.
+    rise or sustained fall cannot be resolved.
     """
     del transition_persistence, transition_min_width
 
