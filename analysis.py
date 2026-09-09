@@ -48,12 +48,10 @@ class CycleAnalysisResult:
 
     @property
     def transition_indices(self) -> list[int]:
-        """Backward-compatible alias for Point C indices."""
         return self.point_c_indices
 
     @property
     def recovered_transition_indices(self) -> list[int]:
-        """Backward-compatible alias for recovered-cycle Point C indices."""
         return self.recovered_point_c_indices
 
 
@@ -178,7 +176,7 @@ def _effective_savgol_window(
     requested_window: int,
     polyorder: int = 2,
 ) -> int | None:
-    """Return a valid odd Savitzky-Golay window for a transition-search segment."""
+    """Return a valid odd Savitzky-Golay window."""
     if segment_length < 3 or polyorder < 1:
         return None
 
@@ -192,45 +190,42 @@ def _effective_savgol_window(
     return window
 
 
-def _detect_side_transition_index(
+def _detect_plateau_transition_indices(
     time_values: np.ndarray,
     thickness_values: np.ndarray,
-    start_idx: int,
-    end_idx: int,
-    direction: str,
+    min1_idx: int,
+    max_idx: int,
+    min2_idx: int,
     smoothing_window: int = 3,
-    onset_fraction: float = 0.35,
-    persistence: int = 2,
+    plateau_fraction: float = 0.35,
     polyorder: int = 2,
-) -> int | None:
-    """Find a distinct transition onset inside one side of a max-anchored cycle.
+) -> tuple[int, int] | None:
+    """Locate B and C as the two edges of the purge/plateau around the maximum.
 
-    ``direction="rising"`` searches A -> maximum for Point B.
-    ``direction="falling"`` searches maximum -> D for Point C.
+    A and D are minima and the detected maximum is only an anchor. The interval
+    slopes are measured after light smoothing. The active rise before the maximum
+    and active fall after it establish reference slope magnitudes. Starting at the
+    maximum, the detector expands left and right through intervals whose absolute
+    slope is small relative to those active slopes.
 
-    The maximum is only an anchor that splits the cycle. It can never be returned
-    as B or C because the selected transition must be strictly inside the search
-    interval.
+    B is the left edge of that low-slope plateau and C is the right edge. Small
+    positive or negative drift during purge is therefore allowed. If the trace
+    changes directly from rise to fall with no resolved plateau, B and C may both
+    equal the maximum anchor.
     """
-    if direction not in {"rising", "falling"}:
-        return None
-    if not (0.01 <= float(onset_fraction) <= 0.95):
-        return None
-
-    persistence = int(persistence)
-    if persistence < 1:
+    if not (0.01 <= float(plateau_fraction) <= 0.95):
         return None
     if polyorder not in (2, 3):
         return None
-    if end_idx <= start_idx:
+    if not (min1_idx < max_idx < min2_idx):
         return None
 
-    segment_time = np.asarray(time_values[start_idx : end_idx + 1], dtype=float)
+    segment_time = np.asarray(time_values[min1_idx : min2_idx + 1], dtype=float)
     segment_thickness = np.asarray(
-        thickness_values[start_idx : end_idx + 1], dtype=float
+        thickness_values[min1_idx : min2_idx + 1], dtype=float
     )
 
-    if len(segment_time) < 4:
+    if len(segment_time) < 3:
         return None
     if not np.isfinite(segment_time).all() or not np.isfinite(segment_thickness).all():
         return None
@@ -243,57 +238,80 @@ def _detect_side_transition_index(
     if effective_window is None:
         return None
 
-    smoothed_thickness = signal.savgol_filter(
+    smoothed = signal.savgol_filter(
         segment_thickness,
         window_length=effective_window,
         polyorder=polyorder,
         mode="interp",
     )
-    slope = np.gradient(smoothed_thickness, segment_time)
+    interval_slopes = np.diff(smoothed) / np.diff(segment_time)
 
-    process_strength = slope if direction == "rising" else -slope
-    interior_strength = process_strength[1:-1]
-    if len(interior_strength) == 0 or not np.isfinite(interior_strength).any():
+    max_local_idx = max_idx - min1_idx
+    left_slopes = interval_slopes[:max_local_idx]
+    right_slopes = interval_slopes[max_local_idx:]
+
+    positive_rise = left_slopes[left_slopes > 0]
+    negative_fall = -right_slopes[right_slopes < 0]
+    if len(positive_rise) == 0 or len(negative_fall) == 0:
         return None
 
-    strongest_local_idx = int(np.nanargmax(interior_strength) + 1)
-    strongest_strength = float(process_strength[strongest_local_idx])
-
-    pre_transition_strength = process_strength[1:strongest_local_idx]
+    # A percentile is less sensitive to one noisy derivative spike than max().
+    rise_reference = float(np.nanpercentile(positive_rise, 75))
+    fall_reference = float(np.nanpercentile(negative_fall, 75))
     if (
-        len(pre_transition_strength) == 0
-        or not np.isfinite(pre_transition_strength).any()
+        not np.isfinite(rise_reference)
+        or not np.isfinite(fall_reference)
+        or rise_reference <= 0
+        or fall_reference <= 0
     ):
         return None
 
-    baseline_count = max(
-        1, min(5, int(np.ceil(len(pre_transition_strength) * 0.5)))
-    )
-    baseline_strength = float(
-        np.nanmedian(pre_transition_strength[:baseline_count])
-    )
-    if not np.isfinite(baseline_strength) or strongest_strength <= baseline_strength:
-        return None
+    rise_plateau_limit = float(plateau_fraction) * rise_reference
+    fall_plateau_limit = float(plateau_fraction) * fall_reference
 
-    onset_threshold = baseline_strength + float(onset_fraction) * (
-        strongest_strength - baseline_strength
-    )
-
-    onset_local_idx = strongest_local_idx
+    # Walk left from the maximum through the low-slope purge region.
+    left_interval_idx = max_local_idx - 1
     while (
-        onset_local_idx > 1
-        and process_strength[onset_local_idx - 1] >= onset_threshold
+        left_interval_idx >= 0
+        and abs(interval_slopes[left_interval_idx]) <= rise_plateau_limit
     ):
-        onset_local_idx -= 1
+        left_interval_idx -= 1
+    point_b_local_idx = left_interval_idx + 1
 
-    run_length = strongest_local_idx - onset_local_idx + 1
-    if run_length < persistence:
+    # Walk right from the maximum through the low-slope purge region.
+    right_interval_idx = max_local_idx
+    while (
+        right_interval_idx < len(interval_slopes)
+        and abs(interval_slopes[right_interval_idx]) <= fall_plateau_limit
+    ):
+        right_interval_idx += 1
+    point_c_local_idx = right_interval_idx
+
+    # B must come after A and there must be a real positive-rise regime before B.
+    if point_b_local_idx <= 0:
+        return None
+    if not np.any(left_slopes[:point_b_local_idx] > rise_plateau_limit):
         return None
 
-    if onset_local_idx <= 0 or onset_local_idx >= len(segment_time) - 1:
+    # C must come before D and there must be a real negative-fall regime after C.
+    if point_c_local_idx >= len(segment_time) - 1:
+        return None
+    if not np.any(interval_slopes[point_c_local_idx:] < -fall_plateau_limit):
         return None
 
-    return start_idx + onset_local_idx
+    if not (
+        0
+        < point_b_local_idx
+        <= max_local_idx
+        <= point_c_local_idx
+        < len(segment_time) - 1
+    ):
+        return None
+
+    return (
+        min1_idx + point_b_local_idx,
+        min1_idx + point_c_local_idx,
+    )
 
 
 def _detect_transition_index(
@@ -307,19 +325,46 @@ def _detect_transition_index(
     polyorder: int = 2,
     min_width: float | None = None,
 ) -> int | None:
-    """Backward-compatible Point C wrapper for the falling side of a cycle."""
-    del min_width
-    return _detect_side_transition_index(
-        time_values=time_values,
-        thickness_values=thickness_values,
-        start_idx=max_idx,
-        end_idx=min2_idx,
-        direction="falling",
-        smoothing_window=smoothing_window,
-        onset_fraction=onset_fraction,
-        persistence=persistence,
-        polyorder=polyorder,
+    """Backward-compatible one-sided Point C detector after a maximum anchor."""
+    del persistence, min_width
+
+    if not (max_idx < min2_idx):
+        return None
+
+    segment_time = np.asarray(time_values[max_idx : min2_idx + 1], dtype=float)
+    segment_thickness = np.asarray(
+        thickness_values[max_idx : min2_idx + 1], dtype=float
     )
+    if len(segment_time) < 2 or np.any(np.diff(segment_time) <= 0):
+        return None
+
+    effective_window = _effective_savgol_window(
+        len(segment_time), smoothing_window, polyorder
+    )
+    if effective_window is None:
+        return None
+
+    smoothed = signal.savgol_filter(
+        segment_thickness,
+        window_length=effective_window,
+        polyorder=polyorder,
+        mode="interp",
+    )
+    slopes = np.diff(smoothed) / np.diff(segment_time)
+    negative_fall = -slopes[slopes < 0]
+    if len(negative_fall) == 0:
+        return None
+
+    fall_reference = float(np.nanpercentile(negative_fall, 75))
+    plateau_limit = float(onset_fraction) * fall_reference
+
+    interval_idx = 0
+    while interval_idx < len(slopes) and abs(slopes[interval_idx]) <= plateau_limit:
+        interval_idx += 1
+
+    if interval_idx >= len(slopes):
+        return None
+    return max_idx + interval_idx
 
 
 def calculate_cycles(
@@ -334,16 +379,17 @@ def calculate_cycles(
     transition_polyorder: int = 2,
     transition_min_width: float | None = None,
 ) -> CycleAnalysisResult:
-    """Calculate A -> B -> max anchor -> C -> D cycles.
+    """Calculate max-anchored cycles using the two edges of the purge plateau.
 
-    A and D are successive minima. The detected maximum between them is used only
-    as an anchor to split the search:
-      - B = rising-side transition inside A -> maximum
-      - C = falling-side transition inside maximum -> D
+    A and D are successive minima. The detected maximum anchors the low-slope
+    purge/plateau region:
+      - B = left edge of the plateau after the active rise
+      - C = right edge of the plateau before the active fall
 
-    A cycle is rejected unless both transitions are distinct.
+    The maximum may equal B, C, or both. A cycle is rejected when a meaningful
+    rise, plateau boundary, or fall cannot be resolved.
     """
-    del transition_min_width
+    del transition_persistence, transition_min_width
 
     recovered_min_set = set(recovered_min_indices or [])
     recovered_max_set = set(recovered_max_indices or [])
@@ -377,35 +423,27 @@ def calculate_cycles(
         max_anchor_idx = int(max_anchor_event["Index"])
         point_d_idx = int(point_d_event["Index"])
 
-        point_b_idx = _detect_side_transition_index(
+        transitions = _detect_plateau_transition_indices(
             time_values=time_values,
             thickness_values=thickness_values,
-            start_idx=point_a_idx,
-            end_idx=max_anchor_idx,
-            direction="rising",
+            min1_idx=point_a_idx,
+            max_idx=max_anchor_idx,
+            min2_idx=point_d_idx,
             smoothing_window=transition_smoothing_window,
-            onset_fraction=transition_onset_fraction,
-            persistence=transition_persistence,
+            plateau_fraction=transition_onset_fraction,
             polyorder=transition_polyorder,
         )
-        point_c_idx = _detect_side_transition_index(
-            time_values=time_values,
-            thickness_values=thickness_values,
-            start_idx=max_anchor_idx,
-            end_idx=point_d_idx,
-            direction="falling",
-            smoothing_window=transition_smoothing_window,
-            onset_fraction=transition_onset_fraction,
-            persistence=transition_persistence,
-            polyorder=transition_polyorder,
-        )
-
-        if point_b_idx is None or point_c_idx is None:
+        if transitions is None:
             derivative_failures += 1
             continue
 
+        point_b_idx, point_c_idx = transitions
         if not (
-            point_a_idx < point_b_idx < max_anchor_idx < point_c_idx < point_d_idx
+            point_a_idx
+            < point_b_idx
+            <= max_anchor_idx
+            <= point_c_idx
+            < point_d_idx
         ):
             derivative_failures += 1
             continue
