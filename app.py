@@ -26,6 +26,7 @@ detect_extrema = analysis_core.detect_extrema
 downsample_for_plot = analysis_core.downsample_for_plot
 find_suspect_regions = analysis_core.find_suspect_regions
 recover_missing_extremum = analysis_core.recover_missing_extremum
+flat_aware_local_extrema_candidates = analysis_core._flat_aware_local_extrema_candidates
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
@@ -168,6 +169,94 @@ def _candidate_index(recovery, missing_type: str) -> int | None:
         return int(recovery.recovered_min_indices[0])
     if missing_type == "max" and recovery.recovered_max_indices:
         return int(recovery.recovered_max_indices[0])
+    return None
+
+
+def _is_flat_recovery_candidate(
+    thickness_values: np.ndarray,
+    candidate_idx: int,
+    region_start: int,
+    region_end: int,
+) -> bool:
+    """Return True when the recovery point belongs to a repeated-value plateau."""
+    candidate_idx = int(candidate_idx)
+    value = float(thickness_values[candidate_idx])
+    left_equal = (
+        candidate_idx > int(region_start)
+        and np.isclose(
+            float(thickness_values[candidate_idx - 1]),
+            value,
+            rtol=0.0,
+            atol=1e-12,
+        )
+    )
+    right_equal = (
+        candidate_idx < int(region_end)
+        and np.isclose(
+            float(thickness_values[candidate_idx + 1]),
+            value,
+            rtol=0.0,
+            atol=1e-12,
+        )
+    )
+    return bool(left_equal or right_equal)
+
+
+def _find_flat_only_recovery_candidate(
+    thickness_values: np.ndarray,
+    issue: dict,
+    recovery_order: int = 1,
+) -> int | None:
+    """Find the strongest true flat extremum inside one broken region."""
+    missing_type = str(issue["Missing Type"])
+    region_start = int(issue["Start Index"])
+    region_end = int(issue["End Index"])
+    order = max(1, int(recovery_order))
+
+    padding = max(order * 2, 5)
+    padded_start = max(0, region_start - padding)
+    padded_end = min(len(thickness_values) - 1, region_end + padding)
+    local_thickness = np.asarray(
+        thickness_values[padded_start : padded_end + 1], dtype=float
+    )
+    local_max_order = max(1, (len(local_thickness) - 1) // 2)
+    effective_order = min(order, local_max_order)
+
+    local_candidates = flat_aware_local_extrema_candidates(
+        local_thickness=local_thickness,
+        order=effective_order,
+        missing_type=missing_type,
+    )
+    candidates = local_candidates + padded_start
+    candidates = candidates[(candidates > region_start) & (candidates < region_end)]
+    flat_candidates = np.asarray(
+        [
+            int(idx)
+            for idx in candidates
+            if _is_flat_recovery_candidate(
+                thickness_values,
+                int(idx),
+                region_start,
+                region_end,
+            )
+        ],
+        dtype=int,
+    )
+    if len(flat_candidates) == 0:
+        return None
+
+    if missing_type == "min":
+        return int(
+            flat_candidates[
+                np.argmin(np.asarray(thickness_values)[flat_candidates])
+            ]
+        )
+    if missing_type == "max":
+        return int(
+            flat_candidates[
+                np.argmax(np.asarray(thickness_values)[flat_candidates])
+            ]
+        )
     return None
 
 
@@ -508,9 +597,15 @@ view with the exact **A, B, maximum anchor, C, and D** used for the calculations
 **Per-region missing-point recovery**  
 Broken **MAX → MAX** or **MIN → MIN** regions can each have their own local extrema
 order. Changing the local order previews a candidate only in that region. Use
-**Save/apply this local order** to keep that order while you tune other regions.
-Saved local orders are reapplied independently during the current Streamlit
-session and do not change the global minimum/maximum orders.
+**Save/apply** to keep that order while you tune other regions. Saved local orders
+are reapplied independently during the current Streamlit session and do not change
+the global minimum/maximum orders.
+
+**Bulk flat recovery**  
+Use **Save/apply all flat missing points** to scan every broken region with local
+order 1 and save only genuine repeated-value flat minima/maxima. Ordinary sharp
+candidates are left for manual review, and existing manual saves are not
+overwritten.
 
 **Time direction**  
 Uploaded data are automatically sorted by the selected time column before
@@ -705,20 +800,82 @@ if "local_recovery_profiles" not in st.session_state:
 all_recovery_profiles = st.session_state["local_recovery_profiles"]
 saved_recovery_orders = all_recovery_profiles.setdefault(recovery_context_key, {})
 
+# Bulk-flat recoveries store the exact candidate index as well as order=1 so a
+# later general local search cannot replace the flat point with a sharp candidate.
+if "bulk_flat_recovery_candidates" not in st.session_state:
+    st.session_state["bulk_flat_recovery_candidates"] = {}
+all_bulk_flat_candidates = st.session_state["bulk_flat_recovery_candidates"]
+bulk_flat_saved_candidates = all_bulk_flat_candidates.setdefault(
+    recovery_context_key, {}
+)
+
 st.sidebar.header("Missing Point Recovery")
 use_recovery = st.sidebar.checkbox("Enable missing-point recovery", value=False)
 
 if use_recovery:
+    notice_key = f"bulk_flat_notice:{recovery_context_key}"
+    if notice_key in st.session_state:
+        st.sidebar.success(st.session_state.pop(notice_key))
+
     current_issue_keys = {_recovery_issue_key(issue) for issue in suspect_regions}
     active_saved_count = sum(
         1 for key in saved_recovery_orders if key in current_issue_keys
     )
+    active_bulk_flat_count = sum(
+        1 for key in bulk_flat_saved_candidates if key in current_issue_keys
+    )
     if active_saved_count:
-        st.sidebar.caption(f"{active_saved_count} saved local recovery order(s) active.")
+        st.sidebar.caption(
+            f"{active_saved_count} saved local recovery order(s) active "
+            f"({active_bulk_flat_count} bulk-flat)."
+        )
 
     if not suspect_regions:
         st.sidebar.caption("No broken MIN/MAX alternation was detected.")
     else:
+        with st.sidebar.expander("Bulk flat-point recovery", expanded=False):
+            st.caption(
+                "Scans every broken region with local order 1 and saves only "
+                "genuine repeated-value flat minima/maxima. Manual saves are "
+                "left unchanged."
+            )
+            if st.button(
+                "Save/apply all flat missing points",
+                key=f"bulk_flat_apply:{recovery_context_key}",
+                use_container_width=True,
+            ):
+                flat_found = 0
+                newly_saved = 0
+                manual_preserved = 0
+
+                for issue in suspect_regions:
+                    issue_key = _recovery_issue_key(issue)
+                    flat_candidate_idx = _find_flat_only_recovery_candidate(
+                        thickness_values=thickness_values,
+                        issue=issue,
+                        recovery_order=1,
+                    )
+                    if flat_candidate_idx is None:
+                        continue
+
+                    flat_found += 1
+                    if (
+                        issue_key in saved_recovery_orders
+                        and issue_key not in bulk_flat_saved_candidates
+                    ):
+                        manual_preserved += 1
+                        continue
+
+                    saved_recovery_orders[issue_key] = 1
+                    bulk_flat_saved_candidates[issue_key] = int(flat_candidate_idx)
+                    newly_saved += 1
+
+                st.session_state[notice_key] = (
+                    f"Flat scan found {flat_found} region(s); saved/refreshed "
+                    f"{newly_saved}. Preserved {manual_preserved} manual save(s)."
+                )
+                st.rerun()
+
         issue_number = st.sidebar.selectbox(
             "Missing-point region",
             list(range(len(suspect_regions))),
@@ -728,9 +885,15 @@ if use_recovery:
                 f"({suspect_regions[idx]['Start Time']:.3f}–"
                 f"{suspect_regions[idx]['End Time']:.3f})"
                 + (
-                    " • saved"
-                    if _recovery_issue_key(suspect_regions[idx]) in saved_recovery_orders
-                    else ""
+                    " • flat-auto"
+                    if _recovery_issue_key(suspect_regions[idx])
+                    in bulk_flat_saved_candidates
+                    else (
+                        " • saved"
+                        if _recovery_issue_key(suspect_regions[idx])
+                        in saved_recovery_orders
+                        else ""
+                    )
                 )
             ),
             key="missing_point_region_selector",
@@ -777,7 +940,11 @@ if use_recovery:
             preview_recovery, missing_type
         )
 
-        if selected_issue_saved_order is not None:
+        if selected_issue_key in bulk_flat_saved_candidates:
+            selected_saved_candidate_idx = int(
+                bulk_flat_saved_candidates[selected_issue_key]
+            )
+        elif selected_issue_saved_order is not None:
             saved_preview = recover_missing_extremum(
                 thickness_values=thickness_values,
                 min_indices=base_min_indices,
@@ -810,10 +977,12 @@ if use_recovery:
                 )
             else:
                 saved_recovery_orders[selected_issue_key] = int(recovery_order)
+                bulk_flat_saved_candidates.pop(selected_issue_key, None)
                 st.rerun()
 
         if reset_local:
             saved_recovery_orders.pop(selected_issue_key, None)
+            bulk_flat_saved_candidates.pop(selected_issue_key, None)
             st.session_state.pop(slider_key, None)
             st.rerun()
 
@@ -823,13 +992,29 @@ if use_recovery:
             use_container_width=True,
         ):
             saved_recovery_orders.clear()
+            bulk_flat_saved_candidates.clear()
             st.rerun()
 
-    # Apply every saved local override independently. Unsaved slider previews do
-    # not alter the cycle calculation.
+    # Apply every saved local override independently. Bulk-flat saves use their
+    # exact stored candidate so a different sharp point cannot replace them.
     for issue in suspect_regions:
         issue_key = _recovery_issue_key(issue)
         if issue_key not in saved_recovery_orders:
+            continue
+
+        missing_type = str(issue["Missing Type"])
+        if issue_key in bulk_flat_saved_candidates:
+            recovered_idx = int(bulk_flat_saved_candidates[issue_key])
+            if missing_type == "min":
+                min_indices = np.unique(
+                    np.append(min_indices, recovered_idx)
+                ).astype(int)
+                recovered_min_indices.append(recovered_idx)
+            elif missing_type == "max":
+                max_indices = np.unique(
+                    np.append(max_indices, recovered_idx)
+                ).astype(int)
+                recovered_max_indices.append(recovered_idx)
             continue
 
         saved_order = int(saved_recovery_orders[issue_key])
@@ -902,10 +1087,19 @@ plot_cycle_analysis(
 
 if use_recovery and selected_issue is not None:
     st.subheader("Inspect Missing-Point Region")
+    selected_is_bulk_flat = (
+        _recovery_issue_key(selected_issue) in bulk_flat_saved_candidates
+    )
+    source_text = (
+        " This point was saved by the bulk flat-recovery scan."
+        if selected_is_bulk_flat
+        else ""
+    )
     st.caption(
         f"Approximate cycle {selected_issue_approx_cycle}: possible missing "
         f"{str(selected_issue['Missing Type']).upper()}. The preview marker follows "
         "the current local-order slider; only the saved marker is used in analysis."
+        + source_text
     )
     missing_padding = st.slider(
         "Missing-region padding (samples)",
@@ -988,10 +1182,12 @@ if use_recovery:
     active_saved_keys = {
         _recovery_issue_key(issue) for issue in suspect_regions
     } & set(saved_recovery_orders)
+    active_bulk_keys = active_saved_keys & set(bulk_flat_saved_candidates)
     st.caption(
-        f"Applied local recoveries: {len(active_saved_keys)} region(s); "
-        f"recovered minima: {len(recovered_min_indices)}, "
-        f"recovered maxima: {len(recovered_max_indices)}."
+        f"Applied local recoveries: {len(active_saved_keys)} region(s) "
+        f"({len(active_bulk_keys)} bulk-flat); recovered minima: "
+        f"{len(recovered_min_indices)}, recovered maxima: "
+        f"{len(recovered_max_indices)}."
     )
 
 if len(cycle_df) > 0:
