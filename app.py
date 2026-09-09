@@ -459,20 +459,20 @@ if min_order > window_max_order or max_order > window_max_order:
     )
 
 st.sidebar.header("Point C: etch onset")
-max_transition_window = min(51, max(5, len(analysis_df)))
+max_transition_window = min(51, max(3, len(analysis_df)))
 if max_transition_window % 2 == 0:
     max_transition_window -= 1
-max_transition_window = max(5, max_transition_window)
+max_transition_window = max(3, max_transition_window)
 
 transition_smoothing_window = st.sidebar.slider(
     "Smoothing window (samples)",
-    min_value=5,
+    min_value=3,
     max_value=max_transition_window,
-    value=min(5, max_transition_window),
+    value=min(3, max_transition_window),
     step=2,
     help=(
-        "Light smoothing before dh/dt is calculated. Keep this small for "
-        "near-instantaneous etch events."
+        "Light smoothing before dh/dt is calculated. A 3-sample window preserves "
+        "short transition events better than the previous 5-sample minimum."
     ),
 )
 
