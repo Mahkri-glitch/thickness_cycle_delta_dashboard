@@ -112,7 +112,7 @@ def test_falling_wrapper_finds_right_plateau_edge():
     assert 0 <= transition_idx < 7
 
 
-def test_cycle_math_uses_plateau_edges():
+def test_cycle_math_uses_plateau_edges_and_stores_max_anchor():
     time = np.arange(10, dtype=float)
     thickness = np.array(
         [0.0, 1.0, 2.0, 3.0, 3.05, 3.02, 3.00, 2.0, 1.0, 0.0],
@@ -140,6 +140,9 @@ def test_cycle_math_uses_plateau_edges():
     c = int(row["Point C Index"])
 
     assert (b, c) == (3, 6)
+    assert int(row["Max Anchor Index"]) == 4
+    assert row["Max Anchor Time"] == time[4]
+    assert row["Max Anchor Thickness"] == thickness[4]
     assert np.isclose(row["Delta 1"], thickness[b] - thickness[0])
     assert np.isclose(row["Delta 2"], thickness[b] - thickness[c])
     assert np.isclose(row["Delta 3"], thickness[c] - thickness[9])
