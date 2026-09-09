@@ -1,55 +1,50 @@
 # Thickness Cycle Delta Analyzer
 
-A Streamlit dashboard for analyzing cyclic thickness-vs-time data for an **ALD/ALE process**. The program detects repeated extrema, uses each detected maximum as an internal anchor, finds two transition points around that maximum, and reports Δ1, Δ2, and Δ3 for each valid cycle.
+A Streamlit dashboard for analyzing cyclic thickness-vs-time data for an **ALD/ALE process**. The program detects repeated extrema, uses each detected maximum as an internal anchor, identifies the low-slope purge/plateau around that maximum, and reports Δ1, Δ2, and Δ3 for each valid cycle.
 
-The dashboard first identifies a strict **minimum → maximum → minimum** sequence in **forward physical time**.
+The dashboard first identifies a **minimum → maximum → minimum** sequence in **forward physical time**.
 
 ## ALD/ALE process definition
 
 ```text
 A = first minimum
-B = rising-side transition between A and the maximum anchor
-M = detected maximum anchor (not exported as B or C)
-C = falling-side transition between the maximum anchor and D
+B = entry into the low-slope purge/plateau after the active rise
+M = detected maximum anchor inside or at an edge of the purge region
+C = exit from the low-slope purge/plateau before the active fall
 D = next minimum
 
-Required ordering: A < B < M < C < D
+Required ordering: A < B <= M <= C < D
 
 Δ1 = B - A
 Δ2 = B - C
 Δ3 = C - D
 ```
 
-The maximum is used only to split the cycle into two transition-search regions. It can never be returned as Point B or Point C.
+The maximum is a reference point, not a forced process boundary. It may equal B, C, or both if that is what the sampled trace resolves.
 
-If either B or C is not distinctly resolved, the cycle is rejected rather than forcing a transition point.
+## Purge plateau detection
 
-## Transition detection
+For each A → maximum → D cycle the detector:
 
-Each side of the maximum anchor is analyzed independently:
+1. lightly smooths the local thickness trace,
+2. calculates the slope between adjacent measurements,
+3. uses the active positive rise before the maximum as a reference rate,
+4. uses the active negative fall after the maximum as a reference rate,
+5. starts at the maximum and expands left and right through the contiguous **low-slope** region, and
+6. returns the left edge as B and the right edge as C.
 
-1. lightly smooth the local thickness trace,
-2. calculate `dh/dt`,
-3. on **A → maximum**, find the onset of the strongest rising regime for Point B,
-4. on **maximum → D**, find the onset of the strongest falling regime for Point C,
-5. require the selected transition to be strictly inside its search interval, and
-6. reject the cycle if either transition cannot be resolved.
+Because plateau membership is based on **slope magnitude**, the purge region may drift slightly upward or downward instead of being perfectly flat.
 
-This prevents the detected maximum from being mislabeled as a process transition.
-
-## Transition controls
+## Controls
 
 - **Smoothing window (samples)** — default **3**. Smaller smoothing helps preserve short ellipsometry transition events.
-- **Transition threshold (% of slope change)** — default **35%**. Lower values detect an earlier onset; higher values place B/C closer to the strongest slope.
-- **Transition persistence (samples)** — default **2**. The transition regime must remain connected for at least this many samples.
+- **Purge plateau threshold (% of active slope)** — default **35%**. Lower values require a flatter purge region; higher values allow more positive/negative drift and widen the B → C region.
 
 The Savitzky-Golay polynomial order is fixed internally at 2 in the dashboard.
 
 ## Time direction
 
 The uploaded file may be ordered with time increasing or decreasing. The dashboard automatically sorts the selected time column into **ascending chronological order before any extrema or transition calculations**.
-
-If the file is detected as descending in time, the dashboard displays a notice. If the time values are non-monotonic, it displays a warning and sorts them before analysis.
 
 Reported point indices refer to the **chronologically sorted analysis window**, not necessarily the original Excel row number. Point times are the recommended reference when comparing datasets.
 
@@ -70,7 +65,7 @@ SciPy relative-extrema `order` controls how many neighboring samples a candidate
 - smaller order = more sensitive to local structure/noise,
 - larger order = more selective.
 
-The extrema settings are independent of the transition detector.
+The extrema settings are independent of the purge plateau detector.
 
 ## Missing-point recovery
 
@@ -85,13 +80,7 @@ Recovery performs a local extrema search inside the selected gap and adds one ca
 
 ## Input
 
-Supported files:
-
-- `.csv`
-- `.xlsx`
-- `.xls`
-
-Select the time and thickness columns in the interface.
+Supported files: `.csv`, `.xlsx`, `.xls`.
 
 ## Run
 
@@ -105,10 +94,10 @@ python -m streamlit run app.py
 1. Upload the dataset and select time/thickness columns.
 2. Select the analysis window.
 3. Tune minimum and maximum extrema orders until the minima and maximum anchors follow the physical cycles.
-4. Start with smoothing = 3, transition threshold = 35%, persistence = 2.
-5. Visually inspect B and C on opposite sides of each maximum anchor.
-6. If either transition is not resolvable, leave that cycle excluded rather than forcing a point.
-7. Download the CSV when satisfied.
+4. Start with smoothing = 3 and purge plateau threshold = 35%.
+5. If B/C are too close to the maximum, increase the plateau threshold.
+6. If the purge region becomes too wide, lower the plateau threshold.
+7. Visually inspect B and C and download the CSV when satisfied.
 
 ## Output columns
 
@@ -125,13 +114,7 @@ The maximum anchor is shown on the plot but is not added to the exported A/B/C/D
 
 ## Testing
 
-The test suite verifies that:
-
-- B is found only on the rising side of the maximum,
-- C is found only on the falling side,
-- neither B nor C can equal the maximum anchor,
-- unresolved transitions reject the cycle, and
-- Δ1/Δ2/Δ3 arithmetic and output columns remain consistent.
+The test suite verifies plateau-entry/exit detection, slight purge drift, maximum-as-transition behavior, and Δ1/Δ2/Δ3 arithmetic.
 
 Run:
 
