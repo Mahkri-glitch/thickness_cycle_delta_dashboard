@@ -63,7 +63,7 @@ MAX → MAX  = possible missing MIN
 MIN → MIN  = possible missing MAX
 ```
 
-Missing-point recovery is now **localized per suspect region** rather than controlled by one recovery order for the entire dataset.
+Missing-point recovery is **localized per suspect region** rather than controlled by one recovery order for the entire dataset.
 
 For each suspect region you can:
 
@@ -77,6 +77,18 @@ For each suspect region you can:
 Saved local orders are stored in Streamlit session state and scoped to the uploaded file, selected analysis window, and selected time/thickness columns. They are reapplied independently during the current Streamlit session and do **not** change the global extrema orders.
 
 Only saved recoveries affect cycle detection. Moving a local-order slider without saving changes the preview only.
+
+### Flat extrema during local recovery
+
+Global extrema detection remains strict. However, **missing-point recovery only** is flat-aware so a true flat top or flat bottom is not lost just because adjacent samples have equal thickness.
+
+For example, a local minimum such as
+
+```text
+... 1.03, 1.00, 1.00, 1.02 ...
+```
+
+can be recovered even though SciPy's strict `argrelmin` would return no point. The flat run is accepted only when its extremal level is strictly bounded by higher values on both sides for a minimum, or lower values on both sides for a maximum. A flat shoulder on a continuing slope is therefore rejected. One representative sample near the middle of the flat run is added as the recovered extremum.
 
 When a saved recovered extremum successfully rebuilds an accepted cycle, the missing-point inspector reports the resulting cycle number and immediately shows that cycle's full **A/B/M/C/D** inspection graph.
 
@@ -144,7 +156,7 @@ The maximum anchor is stored in the cycle results so the individual-cycle inspec
 
 ## Testing
 
-The analysis test suite verifies purge-entry behavior, sustained and instantaneous Point C behavior, slight purge drift, maximum-as-transition behavior, stored maximum-anchor metadata, and Δ1/Δ2/Δ3 arithmetic.
+The analysis test suite verifies flat minimum/maximum recovery, rejection of flat shoulders, purge-entry behavior, sustained and instantaneous Point C behavior, slight purge drift, maximum-as-transition behavior, stored maximum-anchor metadata, and Δ1/Δ2/Δ3 arithmetic.
 
 Run:
 
