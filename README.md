@@ -90,6 +90,21 @@ For example, a local minimum such as
 
 can be recovered even though SciPy's strict `argrelmin` would return no point. The flat run is accepted only when its extremal level is strictly bounded by higher values on both sides for a minimum, or lower values on both sides for a maximum. A flat shoulder on a continuing slope is therefore rejected. One representative sample near the middle of the flat run is added as the recovered extremum.
 
+### Bulk flat missing-point recovery
+
+If many broken regions are caused by repeated-value flat extrema, open **Bulk flat-point recovery** and choose **Save/apply all flat missing points**.
+
+The bulk action:
+
+1. scans every currently detected broken region,
+2. uses local recovery order **1**,
+3. accepts only candidates that belong to a genuine repeated-value flat top or bottom,
+4. saves the exact recovered index for each accepted flat region,
+5. does not overwrite a region that you already saved manually, and
+6. leaves ordinary sharp or ambiguous missing points for individual review.
+
+Bulk-flat regions are labeled **flat-auto** in the missing-point selector. They remain individually editable: manually saving a different local order replaces the bulk-flat recovery for that region, while **Reset region** removes only that region's saved recovery.
+
 When a saved recovered extremum successfully rebuilds an accepted cycle, the missing-point inspector reports the resulting cycle number and immediately shows that cycle's full **A/B/M/C/D** inspection graph.
 
 ## Time direction
@@ -134,11 +149,12 @@ python -m streamlit run app.py
 2. Select the analysis window.
 3. Tune global minimum and maximum extrema orders until most cycles follow the physical process.
 4. Start with smoothing = 3 and purge plateau threshold = 35%.
-5. Enable missing-point recovery and tune only the individual broken regions that remain.
-6. Save each useful local recovery order; do not lower the global order just to repair one cycle.
-7. Inspect the recovered cycle directly in the missing-point view.
-8. Use **Inspect Individual Cycle** to verify A/B/M/C/D on representative cycles across the run.
-9. Download the CSV when satisfied.
+5. Enable missing-point recovery.
+6. If many remaining failures are flat extrema, run **Save/apply all flat missing points** first.
+7. Tune any remaining broken regions individually and save their local orders.
+8. Inspect recovered cycles directly in the missing-point view.
+9. Use **Inspect Individual Cycle** to verify A/B/M/C/D on representative cycles across the run.
+10. Download the CSV when satisfied.
 
 ## Output columns
 
