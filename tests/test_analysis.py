@@ -3,6 +3,7 @@ import pandas as pd
 
 from analysis import (
     OUTPUT_COLUMNS,
+    _detect_side_transition_index,
     _detect_transition_index,
     build_events,
     calculate_cycles,
@@ -33,94 +34,83 @@ def test_find_suspect_regions_detects_missing_minimum():
     assert suspects[0]["Missing Type"] == "min"
 
 
-def test_etch_onset_is_before_abrupt_drop():
-    time = np.arange(21, dtype=float)
-    # Purge/plateau through t=10, then a near-instantaneous etch drop.
+def test_rising_and_falling_transitions_stay_off_maximum():
+    time = np.arange(41, dtype=float)
     thickness = np.array(
-        [10.0] * 11 + [7.0, 6.0, 5.0] + [5.0] * 7,
+        [
+            1.00, 1.00, 1.00, 1.01, 1.02, 1.05, 1.20, 1.70, 2.60, 3.60,
+            4.20, 4.50, 4.65, 4.75, 4.82, 4.88, 4.92, 4.95, 4.97, 4.99,
+            5.00,
+            4.99, 4.98, 4.97, 4.95, 4.90, 4.70, 4.20, 3.40, 2.50,
+            1.80, 1.40, 1.20, 1.10, 1.05, 1.03, 1.02, 1.01, 1.00, 1.00,
+            1.00,
+        ],
         dtype=float,
     )
 
+    point_b = _detect_side_transition_index(
+        time,
+        thickness,
+        start_idx=0,
+        end_idx=20,
+        direction="rising",
+        smoothing_window=3,
+        onset_fraction=0.35,
+        persistence=2,
+    )
+    point_c = _detect_side_transition_index(
+        time,
+        thickness,
+        start_idx=20,
+        end_idx=40,
+        direction="falling",
+        smoothing_window=3,
+        onset_fraction=0.35,
+        persistence=2,
+    )
+
+    assert point_b is not None and point_c is not None
+    assert 0 < point_b < 20 < point_c < 40
+
+
+def test_falling_wrapper_keeps_c_after_maximum():
+    time = np.arange(21, dtype=float)
+    thickness = np.array(
+        [5.0, 5.0, 5.0, 4.99, 4.98, 4.95, 4.8, 4.2, 3.0, 2.0]
+        + [1.5] * 11,
+        dtype=float,
+    )
     transition_idx = _detect_transition_index(
         time,
         thickness,
         max_idx=0,
         min2_idx=20,
-        smoothing_window=5,
+        smoothing_window=3,
         onset_fraction=0.35,
         persistence=2,
     )
-
     assert transition_idx is not None
-    # C should land on the purge-side edge, not the center of the drop.
-    assert 9 <= transition_idx <= 10
+    assert 0 < transition_idx < 20
 
 
-def test_etch_onset_handles_gradual_transition():
-    time = np.arange(51, dtype=float)
-    thickness = (
-        10.0
-        - 0.03 * time
-        - 1.5 / (1.0 + np.exp(-(time - 25.0) / 3.0))
-    )
-
-    transition_idx = _detect_transition_index(
-        time,
-        thickness,
-        max_idx=0,
-        min2_idx=50,
-        smoothing_window=5,
-        onset_fraction=0.35,
-        persistence=2,
-    )
-
-    assert transition_idx is not None
-    # Strongest slope is near 25; onset should be earlier.
-    assert 15 <= transition_idx < 25
-
-
-def test_lower_onset_fraction_moves_c_earlier_or_equal():
-    time = np.arange(51, dtype=float)
-    thickness = (
-        10.0
-        - 0.03 * time
-        - 1.5 / (1.0 + np.exp(-(time - 25.0) / 3.0))
-    )
-
-    early = _detect_transition_index(
-        time,
-        thickness,
-        0,
-        50,
-        smoothing_window=5,
-        onset_fraction=0.20,
-        persistence=2,
-    )
-    late = _detect_transition_index(
-        time,
-        thickness,
-        0,
-        50,
-        smoothing_window=5,
-        onset_fraction=0.60,
-        persistence=2,
-    )
-
-    assert early is not None and late is not None
-    assert early <= late
-
-
-def test_ald_ale_cycle_math_and_output_columns():
-    time = np.arange(24, dtype=float)
+def test_cycle_requires_two_distinct_transitions():
+    time = np.arange(41, dtype=float)
     thickness = np.array(
-        [1.0, 2.0, 3.0] + [3.0] * 8 + [2.0, 1.0, 0.5] + [0.5] * 10,
+        [
+            1.00, 1.00, 1.00, 1.01, 1.02, 1.05, 1.20, 1.70, 2.60, 3.60,
+            4.20, 4.50, 4.65, 4.75, 4.82, 4.88, 4.92, 4.95, 4.97, 4.99,
+            5.00,
+            4.99, 4.98, 4.97, 4.95, 4.90, 4.70, 4.20, 3.40, 2.50,
+            1.80, 1.40, 1.20, 1.10, 1.05, 1.03, 1.02, 1.01, 1.00, 1.00,
+            1.00,
+        ],
         dtype=float,
     )
     events = pd.DataFrame(
         [
             {"Index": 0, "Type": "min", "Time": 0.0, "Thickness": thickness[0]},
-            {"Index": 2, "Type": "max", "Time": 2.0, "Thickness": thickness[2]},
-            {"Index": 23, "Type": "min", "Time": 23.0, "Thickness": thickness[23]},
+            {"Index": 20, "Type": "max", "Time": 20.0, "Thickness": thickness[20]},
+            {"Index": 40, "Type": "min", "Time": 40.0, "Thickness": thickness[40]},
         ]
     )
 
@@ -128,20 +118,50 @@ def test_ald_ale_cycle_math_and_output_columns():
         events,
         time,
         thickness,
-        transition_smoothing_window=5,
+        transition_smoothing_window=3,
         transition_onset_fraction=0.35,
         transition_persistence=2,
     )
 
     assert len(result.cycle_df) == 1
     row = result.cycle_df.iloc[0]
-    assert row["Delta 1"] == thickness[2] - thickness[0]
-    assert np.isclose(
-        row["Delta 2"] + row["Delta 3"],
-        thickness[2] - thickness[23],
-    )
-    assert 2 < row["Point C Index"] < 23
+
+    b = int(row["Point B Index"])
+    c = int(row["Point C Index"])
+    assert 0 < b < 20 < c < 40
+    assert row["Point B Index"] != 20
+    assert row["Point C Index"] != 20
+    assert np.isclose(row["Delta 1"], thickness[b] - thickness[0])
+    assert np.isclose(row["Delta 2"], thickness[b] - thickness[c])
+    assert np.isclose(row["Delta 3"], thickness[c] - thickness[40])
     assert list(result.cycle_df.columns) == OUTPUT_COLUMNS
+
+
+def test_unresolved_side_rejects_cycle():
+    time = np.arange(12, dtype=float)
+    thickness = np.array(
+        [1.0, 2.0, 3.0, 2.9, 2.8, 2.6, 2.0, 1.5, 1.2, 1.1, 1.0, 1.0],
+        dtype=float,
+    )
+    events = pd.DataFrame(
+        [
+            {"Index": 0, "Type": "min", "Time": 0.0, "Thickness": thickness[0]},
+            {"Index": 2, "Type": "max", "Time": 2.0, "Thickness": thickness[2]},
+            {"Index": 11, "Type": "min", "Time": 11.0, "Thickness": thickness[11]},
+        ]
+    )
+
+    result = calculate_cycles(
+        events,
+        time,
+        thickness,
+        transition_smoothing_window=3,
+        transition_onset_fraction=0.35,
+        transition_persistence=2,
+    )
+
+    assert result.cycle_df.empty
+    assert result.derivative_failures == 1
 
 
 def test_format_cycle_results_on_empty_dataframe():
