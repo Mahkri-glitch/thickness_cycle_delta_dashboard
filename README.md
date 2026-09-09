@@ -22,7 +22,7 @@ Required ordering: A < B <= M <= C < D
 
 The maximum is a reference point, not a forced process boundary. It may equal B, C, or both if that is what the sampled trace resolves.
 
-## Purge and Point C detection
+## Two-sided B/C transition detection
 
 For each A → maximum → D cycle the detector:
 
@@ -30,10 +30,16 @@ For each A → maximum → D cycle the detector:
 2. calculates the slope between adjacent measurements,
 3. uses the active positive rise before the maximum as a reference rate,
 4. uses the active negative fall after the maximum as a reference rate,
-5. finds B from the low-slope purge region after the active rise, and
-6. finds C as either the first sustained two-interval fall or one clearly instantaneous single drop.
+5. requires **B** to have active-rise behavior on its A-side and low-slope purge behavior on its maximum-side, and
+6. requires **C** to have low-slope purge behavior on its maximum-side and active-fall behavior on its D-side.
 
-The single-drop C path is used only when the drop reaches the representative active-fall rate and is not immediately reversed by a comparably strong rebound. This allows one-sample reaction events while still ignoring ordinary isolated downward excursions during purge.
+B is searched in the forward direction **A → maximum**. If several rise→purge boundary candidates occur because of near-threshold slope changes, the **last valid candidate** is used. This prevents an early partial slope change from becoming B when a later cleaner transition exists.
+
+C is searched in the reverse direction **D → maximum**. The detector keeps the last valid boundary encountered in that reverse scan, which corresponds to the **earliest valid purge→fall boundary in forward time**. This keeps C from drifting to a later post-drop flat or secondary fall feature.
+
+The fall-side condition still supports either a sustained two-interval fall or one clearly instantaneous single drop. A single drop is accepted only when it reaches the representative active-fall rate and is not immediately reversed by a comparably strong rebound.
+
+If the sampled trace changes directly from active rise to active fall with no resolved purge, the detector can still use **B = C = maximum** when both sides are unambiguous there. Otherwise an unresolved two-sided boundary is rejected.
 
 ## Controls
 
@@ -172,7 +178,7 @@ The maximum anchor is stored in the cycle results so the individual-cycle inspec
 
 ## Testing
 
-The analysis test suite verifies flat minimum/maximum recovery, rejection of flat shoulders, purge-entry behavior, sustained and instantaneous Point C behavior, slight purge drift, maximum-as-transition behavior, stored maximum-anchor metadata, and Δ1/Δ2/Δ3 arithmetic.
+The analysis test suite verifies flat minimum/maximum recovery, rejection of flat shoulders, two-sided B/C boundary selection, sustained and instantaneous Point C behavior, slight purge drift, maximum-as-transition behavior, stored maximum-anchor metadata, and Δ1/Δ2/Δ3 arithmetic.
 
 Run:
 
