@@ -271,6 +271,75 @@ def plot_cycle_analysis(
     plt.close(fig)
 
 
+def plot_selected_cycle(
+    cycle_row: pd.Series,
+    time_values: np.ndarray,
+    thickness_values: np.ndarray,
+    time_col: str,
+    thickness_col: str,
+    padding_points: int = 5,
+) -> None:
+    """Plot one accepted cycle with the exact A/B/max/C/D points used in analysis."""
+    a_idx = int(cycle_row["Point A Index"])
+    b_idx = int(cycle_row["Point B Index"])
+    max_idx = int(cycle_row["Max Anchor Index"])
+    c_idx = int(cycle_row["Point C Index"])
+    d_idx = int(cycle_row["Point D Index"])
+
+    left_idx = max(0, a_idx - int(padding_points))
+    right_idx = min(len(time_values) - 1, d_idx + int(padding_points))
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.plot(
+        time_values[left_idx : right_idx + 1],
+        thickness_values[left_idx : right_idx + 1],
+        linewidth=2,
+        label="Thickness",
+    )
+
+    if b_idx < c_idx:
+        ax.axvspan(
+            time_values[b_idx],
+            time_values[c_idx],
+            alpha=0.10,
+            label="Detected purge plateau",
+        )
+
+    point_specs = [
+        ("A", a_idx, "o", 120, (6, -20)),
+        ("B", b_idx, ">", 150, (-22, 18)),
+        ("M", max_idx, "s", 150, (0, 32)),
+        ("C", c_idx, "^", 150, (22, 18)),
+        ("D", d_idx, "o", 120, (6, -20)),
+    ]
+
+    for label, idx, marker, size, offset in point_specs:
+        ax.scatter(
+            [time_values[idx]],
+            [thickness_values[idx]],
+            s=size,
+            marker=marker,
+            label=f"{label}: " + ("Maximum anchor" if label == "M" else f"Point {label}"),
+        )
+        ax.annotate(
+            label,
+            (time_values[idx], thickness_values[idx]),
+            xytext=offset,
+            textcoords="offset points",
+            ha="center",
+            fontweight="bold",
+        )
+
+    cycle_number = int(cycle_row["Cycle"])
+    ax.set_title(f"Cycle {cycle_number}: isolated A/B/M/C/D inspection")
+    ax.set_xlabel(time_col)
+    ax.set_ylabel(thickness_col)
+    ax.grid(alpha=0.2)
+    ax.legend()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
 def show_interpretation_guide() -> None:
     with st.expander("How to interpret the analysis"):
         st.markdown(
@@ -311,6 +380,12 @@ This is the largest slope magnitude that can still count as part of the purge
 plateau, expressed as a percentage of the active rise/fall rate. Lower values
 require a flatter purge. Higher values allow more gradual drift and produce a
 wider B → C region.
+
+**Individual cycle inspector**  
+For long datasets, select any accepted cycle below the main plot to see a zoomed
+view with the exact **A, B, maximum anchor, C, and D** used for the calculations.
+The inspector does not re-run or change the detector; it only visualizes the
+stored cycle result.
 
 **Time direction**  
 Uploaded data are automatically sorted by the selected time column before
@@ -607,6 +682,78 @@ if cycle_df.empty:
     st.write("No complete ALD/ALE cycles are available in the selected analysis window.")
 else:
     st.dataframe(cycle_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Inspect Individual Cycle")
+    selector_col, padding_col = st.columns([2, 1])
+    cycle_numbers = cycle_df["Cycle"].astype(int).tolist()
+
+    with selector_col:
+        selected_cycle_number = st.selectbox(
+            "Cycle",
+            cycle_numbers,
+            format_func=lambda value: f"Cycle {value}",
+            key="individual_cycle_selector",
+        )
+    with padding_col:
+        padding_points = st.slider(
+            "Padding (samples)",
+            min_value=0,
+            max_value=50,
+            value=5,
+            step=1,
+            help="Extra samples shown before A and after D for visual context.",
+            key="individual_cycle_padding",
+        )
+
+    selected_cycle_row = cycle_df.loc[
+        cycle_df["Cycle"].astype(int) == int(selected_cycle_number)
+    ].iloc[0]
+
+    plot_selected_cycle(
+        cycle_row=selected_cycle_row,
+        time_values=time_values,
+        thickness_values=thickness_values,
+        time_col=time_col,
+        thickness_col=thickness_col,
+        padding_points=padding_points,
+    )
+
+    point_summary = pd.DataFrame(
+        [
+            {
+                "Point": "A",
+                "Index": int(selected_cycle_row["Point A Index"]),
+                "Time": float(selected_cycle_row["Point A Time"]),
+                "Thickness": float(selected_cycle_row["Point A Thickness"]),
+            },
+            {
+                "Point": "B",
+                "Index": int(selected_cycle_row["Point B Index"]),
+                "Time": float(selected_cycle_row["Point B Time"]),
+                "Thickness": float(selected_cycle_row["Point B Thickness"]),
+            },
+            {
+                "Point": "M (max anchor)",
+                "Index": int(selected_cycle_row["Max Anchor Index"]),
+                "Time": float(selected_cycle_row["Max Anchor Time"]),
+                "Thickness": float(selected_cycle_row["Max Anchor Thickness"]),
+            },
+            {
+                "Point": "C",
+                "Index": int(selected_cycle_row["Point C Index"]),
+                "Time": float(selected_cycle_row["Point C Time"]),
+                "Thickness": float(selected_cycle_row["Point C Thickness"]),
+            },
+            {
+                "Point": "D",
+                "Index": int(selected_cycle_row["Point D Index"]),
+                "Time": float(selected_cycle_row["Point D Time"]),
+                "Thickness": float(selected_cycle_row["Point D Thickness"]),
+            },
+        ]
+    )
+    st.dataframe(point_summary, use_container_width=True, hide_index=True)
+
     st.subheader("Average Δ Values")
     cols = st.columns(3)
     cols[0].metric("Average Δ1", f"{cycle_df['Delta 1'].mean():.4f}")
