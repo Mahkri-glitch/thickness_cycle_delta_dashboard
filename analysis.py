@@ -39,10 +39,22 @@ class RecoveryResult:
 @dataclass
 class CycleAnalysisResult:
     cycle_df: pd.DataFrame
-    transition_indices: list[int]
-    recovered_transition_indices: list[int]
+    point_b_indices: list[int]
+    point_c_indices: list[int]
+    recovered_point_b_indices: list[int]
+    recovered_point_c_indices: list[int]
     rejected_sequences: int
     derivative_failures: int
+
+    @property
+    def transition_indices(self) -> list[int]:
+        """Backward-compatible alias for Point C indices."""
+        return self.point_c_indices
+
+    @property
+    def recovered_transition_indices(self) -> list[int]:
+        """Backward-compatible alias for recovered-cycle Point C indices."""
+        return self.recovered_point_c_indices
 
 
 def detect_extrema(
@@ -166,8 +178,8 @@ def _effective_savgol_window(
     requested_window: int,
     polyorder: int = 2,
 ) -> int | None:
-    """Return a valid odd Savitzky-Golay window for one B -> D segment."""
-    if segment_length < 5 or polyorder < 1:
+    """Return a valid odd Savitzky-Golay window for a transition-search segment."""
+    if segment_length < 3 or polyorder < 1:
         return None
 
     max_window = segment_length if segment_length % 2 == 1 else segment_length - 1
@@ -180,54 +192,45 @@ def _effective_savgol_window(
     return window
 
 
-def _detect_transition_index(
+def _detect_side_transition_index(
     time_values: np.ndarray,
     thickness_values: np.ndarray,
-    max_idx: int,
-    min2_idx: int,
-    smoothing_window: int = 5,
+    start_idx: int,
+    end_idx: int,
+    direction: str,
+    smoothing_window: int = 3,
     onset_fraction: float = 0.35,
     persistence: int = 2,
     polyorder: int = 2,
-    min_width: float | None = None,
 ) -> int | None:
-    """Locate Point C as the onset of the rapid etch-rate regime.
+    """Find a distinct transition onset inside one side of a max-anchored cycle.
 
-    Point C is defined physically as the start of the sustained rapid thickness
-    decrease that leads to Point D. The detector therefore does *not* use the
-    largest second derivative or the center of a large inflection.
+    ``direction="rising"`` searches A -> maximum for Point B.
+    ``direction="falling"`` searches maximum -> D for Point C.
 
-    Procedure for each B -> D segment:
-      1. Lightly smooth thickness with a low-order Savitzky-Golay filter.
-      2. Compute dh/dt and find the most negative slope (strongest etch rate).
-      3. Estimate the pre-etch/purge slope from the early part of B -> etch.
-      4. Set an onset threshold between the purge slope and strongest etch slope.
-      5. Walk backward from the strongest etch point to the beginning of the
-         connected threshold-crossing region. That beginning is Point C.
-      6. Require the etch-rate region to persist for at least ``persistence``
-         samples so isolated derivative noise does not create Point C.
-
-    ``onset_fraction`` controls how far from purge toward the maximum etch rate
-    the threshold lies. Lower values detect an earlier onset; higher values put
-    C closer to the steep drop. ``min_width`` is retained only for compatibility
-    with an older dashboard version and is intentionally ignored.
+    The maximum is only an anchor that splits the cycle. It can never be returned
+    as B or C because the selected transition must be strictly inside the search
+    interval.
     """
-    del min_width
-
+    if direction not in {"rising", "falling"}:
+        return None
     if not (0.01 <= float(onset_fraction) <= 0.95):
         return None
+
     persistence = int(persistence)
     if persistence < 1:
         return None
     if polyorder not in (2, 3):
         return None
+    if end_idx <= start_idx:
+        return None
 
-    segment_time = np.asarray(time_values[max_idx : min2_idx + 1], dtype=float)
+    segment_time = np.asarray(time_values[start_idx : end_idx + 1], dtype=float)
     segment_thickness = np.asarray(
-        thickness_values[max_idx : min2_idx + 1], dtype=float
+        thickness_values[start_idx : end_idx + 1], dtype=float
     )
 
-    if len(segment_time) < 5:
+    if len(segment_time) < 4:
         return None
     if not np.isfinite(segment_time).all() or not np.isfinite(segment_thickness).all():
         return None
@@ -248,34 +251,75 @@ def _detect_transition_index(
     )
     slope = np.gradient(smoothed_thickness, segment_time)
 
-    if len(slope) < 3 or not np.isfinite(slope[1:-1]).any():
-        return None
-    etch_local_idx = int(np.nanargmin(slope[1:-1]) + 1)
-    strongest_etch_slope = float(slope[etch_local_idx])
-
-    pre_etch_slopes = slope[1:etch_local_idx]
-    if len(pre_etch_slopes) == 0 or not np.isfinite(pre_etch_slopes).any():
+    process_strength = slope if direction == "rising" else -slope
+    interior_strength = process_strength[1:-1]
+    if len(interior_strength) == 0 or not np.isfinite(interior_strength).any():
         return None
 
-    baseline_count = max(1, min(5, int(np.ceil(len(pre_etch_slopes) * 0.5))))
-    purge_slope = float(np.nanmedian(pre_etch_slopes[:baseline_count]))
+    strongest_local_idx = int(np.nanargmax(interior_strength) + 1)
+    strongest_strength = float(process_strength[strongest_local_idx])
 
-    if not np.isfinite(purge_slope) or strongest_etch_slope >= purge_slope:
+    pre_transition_strength = process_strength[1:strongest_local_idx]
+    if (
+        len(pre_transition_strength) == 0
+        or not np.isfinite(pre_transition_strength).any()
+    ):
         return None
 
-    onset_threshold = purge_slope + float(onset_fraction) * (
-        strongest_etch_slope - purge_slope
+    baseline_count = max(
+        1, min(5, int(np.ceil(len(pre_transition_strength) * 0.5)))
+    )
+    baseline_strength = float(
+        np.nanmedian(pre_transition_strength[:baseline_count])
+    )
+    if not np.isfinite(baseline_strength) or strongest_strength <= baseline_strength:
+        return None
+
+    onset_threshold = baseline_strength + float(onset_fraction) * (
+        strongest_strength - baseline_strength
     )
 
-    onset_local_idx = etch_local_idx
-    while onset_local_idx > 1 and slope[onset_local_idx - 1] <= onset_threshold:
+    onset_local_idx = strongest_local_idx
+    while (
+        onset_local_idx > 1
+        and process_strength[onset_local_idx - 1] >= onset_threshold
+    ):
         onset_local_idx -= 1
 
-    run_length = etch_local_idx - onset_local_idx + 1
+    run_length = strongest_local_idx - onset_local_idx + 1
     if run_length < persistence:
         return None
 
-    return max_idx + onset_local_idx
+    if onset_local_idx <= 0 or onset_local_idx >= len(segment_time) - 1:
+        return None
+
+    return start_idx + onset_local_idx
+
+
+def _detect_transition_index(
+    time_values: np.ndarray,
+    thickness_values: np.ndarray,
+    max_idx: int,
+    min2_idx: int,
+    smoothing_window: int = 3,
+    onset_fraction: float = 0.35,
+    persistence: int = 2,
+    polyorder: int = 2,
+    min_width: float | None = None,
+) -> int | None:
+    """Backward-compatible Point C wrapper for the falling side of a cycle."""
+    del min_width
+    return _detect_side_transition_index(
+        time_values=time_values,
+        thickness_values=thickness_values,
+        start_idx=max_idx,
+        end_idx=min2_idx,
+        direction="falling",
+        smoothing_window=smoothing_window,
+        onset_fraction=onset_fraction,
+        persistence=persistence,
+        polyorder=polyorder,
+    )
 
 
 def calculate_cycles(
@@ -284,100 +328,133 @@ def calculate_cycles(
     thickness_values: np.ndarray,
     recovered_min_indices: list[int] | None = None,
     recovered_max_indices: list[int] | None = None,
-    transition_smoothing_window: int = 5,
+    transition_smoothing_window: int = 3,
     transition_onset_fraction: float = 0.35,
     transition_persistence: int = 2,
     transition_polyorder: int = 2,
     transition_min_width: float | None = None,
 ) -> CycleAnalysisResult:
-    """Calculate complete ALD/ALE-process MIN -> MAX -> C -> MIN cycles."""
+    """Calculate A -> B -> max anchor -> C -> D cycles.
+
+    A and D are successive minima. The detected maximum between them is used only
+    as an anchor to split the search:
+      - B = rising-side transition inside A -> maximum
+      - C = falling-side transition inside maximum -> D
+
+    A cycle is rejected unless both transitions are distinct.
+    """
+    del transition_min_width
+
     recovered_min_set = set(recovered_min_indices or [])
     recovered_max_set = set(recovered_max_indices or [])
 
     cycles: list[dict] = []
-    transition_indices: list[int] = []
-    recovered_transition_indices: list[int] = []
+    point_b_indices: list[int] = []
+    point_c_indices: list[int] = []
+    recovered_point_b_indices: list[int] = []
+    recovered_point_c_indices: list[int] = []
     rejected_sequences = 0
     derivative_failures = 0
 
     records = events.to_dict("records")
 
     for i in range(len(records) - 2):
-        point_a = records[i]
-        point_b = records[i + 1]
-        point_d = records[i + 2]
+        point_a_event = records[i]
+        max_anchor_event = records[i + 1]
+        point_d_event = records[i + 2]
 
         is_complete_cycle = (
-            point_a["Type"] == "min"
-            and point_b["Type"] == "max"
-            and point_d["Type"] == "min"
+            point_a_event["Type"] == "min"
+            and max_anchor_event["Type"] == "max"
+            and point_d_event["Type"] == "min"
         )
         if not is_complete_cycle:
-            if point_a["Type"] == "min":
+            if point_a_event["Type"] == "min":
                 rejected_sequences += 1
             continue
 
-        point_a_idx = int(point_a["Index"])
-        point_b_idx = int(point_b["Index"])
-        point_d_idx = int(point_d["Index"])
-        thickness_a = float(point_a["Thickness"])
-        thickness_b = float(point_b["Thickness"])
-        thickness_d = float(point_d["Thickness"])
+        point_a_idx = int(point_a_event["Index"])
+        max_anchor_idx = int(max_anchor_event["Index"])
+        point_d_idx = int(point_d_event["Index"])
 
-        transition_idx = _detect_transition_index(
+        point_b_idx = _detect_side_transition_index(
             time_values=time_values,
             thickness_values=thickness_values,
-            max_idx=point_b_idx,
-            min2_idx=point_d_idx,
+            start_idx=point_a_idx,
+            end_idx=max_anchor_idx,
+            direction="rising",
             smoothing_window=transition_smoothing_window,
             onset_fraction=transition_onset_fraction,
             persistence=transition_persistence,
             polyorder=transition_polyorder,
-            min_width=transition_min_width,
         )
-        if transition_idx is None:
+        point_c_idx = _detect_side_transition_index(
+            time_values=time_values,
+            thickness_values=thickness_values,
+            start_idx=max_anchor_idx,
+            end_idx=point_d_idx,
+            direction="falling",
+            smoothing_window=transition_smoothing_window,
+            onset_fraction=transition_onset_fraction,
+            persistence=transition_persistence,
+            polyorder=transition_polyorder,
+        )
+
+        if point_b_idx is None or point_c_idx is None:
             derivative_failures += 1
             continue
 
-        transition_time = float(time_values[transition_idx])
-        transition_thickness = float(thickness_values[transition_idx])
+        if not (
+            point_a_idx < point_b_idx < max_anchor_idx < point_c_idx < point_d_idx
+        ):
+            derivative_failures += 1
+            continue
+
+        thickness_a = float(thickness_values[point_a_idx])
+        thickness_b = float(thickness_values[point_b_idx])
+        thickness_c = float(thickness_values[point_c_idx])
+        thickness_d = float(thickness_values[point_d_idx])
 
         cycle_uses_recovered_extremum = (
             point_a_idx in recovered_min_set
             or point_d_idx in recovered_min_set
-            or point_b_idx in recovered_max_set
+            or max_anchor_idx in recovered_max_set
         )
         if cycle_uses_recovered_extremum:
-            recovered_transition_indices.append(transition_idx)
+            recovered_point_b_indices.append(point_b_idx)
+            recovered_point_c_indices.append(point_c_idx)
         else:
-            transition_indices.append(transition_idx)
+            point_b_indices.append(point_b_idx)
+            point_c_indices.append(point_c_idx)
 
         cycles.append(
             {
                 "Cycle": len(cycles) + 1,
                 "Point A Index": point_a_idx,
-                "Point A Time": float(point_a["Time"]),
+                "Point A Time": float(time_values[point_a_idx]),
                 "Point A Thickness": thickness_a,
                 "Point B Index": point_b_idx,
-                "Point B Time": float(point_b["Time"]),
+                "Point B Time": float(time_values[point_b_idx]),
                 "Point B Thickness": thickness_b,
-                "Point C Index": transition_idx,
-                "Point C Time": transition_time,
-                "Point C Thickness": transition_thickness,
+                "Point C Index": point_c_idx,
+                "Point C Time": float(time_values[point_c_idx]),
+                "Point C Thickness": thickness_c,
                 "Point D Index": point_d_idx,
-                "Point D Time": float(point_d["Time"]),
+                "Point D Time": float(time_values[point_d_idx]),
                 "Point D Thickness": thickness_d,
                 "Delta 1": thickness_b - thickness_a,
-                "Delta 2": thickness_b - transition_thickness,
-                "Delta 3": transition_thickness - thickness_d,
+                "Delta 2": thickness_b - thickness_c,
+                "Delta 3": thickness_c - thickness_d,
             }
         )
 
     cycle_df = format_cycle_results(pd.DataFrame(cycles))
     return CycleAnalysisResult(
         cycle_df=cycle_df,
-        transition_indices=sorted(set(transition_indices)),
-        recovered_transition_indices=sorted(set(recovered_transition_indices)),
+        point_b_indices=sorted(set(point_b_indices)),
+        point_c_indices=sorted(set(point_c_indices)),
+        recovered_point_b_indices=sorted(set(recovered_point_b_indices)),
+        recovered_point_c_indices=sorted(set(recovered_point_c_indices)),
         rejected_sequences=rejected_sequences,
         derivative_failures=derivative_failures,
     )
