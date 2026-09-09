@@ -272,109 +272,41 @@ def _effective_savgol_window(
     return window
 
 
-def _fall_transition_condition(
-    slopes: np.ndarray,
-    interval_idx: int,
-    plateau_limit: float,
-    fall_reference: float,
-) -> bool:
-    """Return whether one interval begins a real sustained or instantaneous fall."""
-    interval_idx = int(interval_idx)
-    if interval_idx < 0 or interval_idx >= len(slopes):
-        return False
-
-    current_slope = float(slopes[interval_idx])
-    sustained_fall = (
-        interval_idx + 1 < len(slopes)
-        and current_slope < -plateau_limit
-        and float(slopes[interval_idx + 1]) < -plateau_limit
-    )
-
-    exceptional_single_drop = current_slope <= -fall_reference
-    strong_immediate_rebound = (
-        interval_idx + 1 < len(slopes)
-        and float(slopes[interval_idx + 1]) >= fall_reference
-    )
-    return bool(
-        sustained_fall
-        or (exceptional_single_drop and not strong_immediate_rebound)
-    )
-
-
 def _find_fall_onset_interval(
     slopes: np.ndarray,
     plateau_limit: float,
     fall_reference: float,
     start_idx: int = 0,
 ) -> int | None:
-    """Return the first sustained or clearly instantaneous active-fall interval."""
+    """Return the first sustained or clearly instantaneous active-fall interval.
+
+    A normal fall needs two consecutive intervals below the plateau threshold.
+    A single interval can also define the onset when its magnitude reaches the
+    representative active-fall rate. To avoid accepting an obvious spike/rebound,
+    that single-drop path is rejected when the next interval rebounds upward with
+    comparable magnitude.
+    """
     for interval_idx in range(int(start_idx), len(slopes)):
-        if _fall_transition_condition(
-            slopes=slopes,
-            interval_idx=interval_idx,
-            plateau_limit=plateau_limit,
-            fall_reference=fall_reference,
+        current_slope = float(slopes[interval_idx])
+
+        sustained_fall = (
+            interval_idx + 1 < len(slopes)
+            and current_slope < -plateau_limit
+            and slopes[interval_idx + 1] < -plateau_limit
+        )
+
+        exceptional_single_drop = current_slope <= -fall_reference
+        strong_immediate_rebound = (
+            interval_idx + 1 < len(slopes)
+            and slopes[interval_idx + 1] >= fall_reference
+        )
+
+        if sustained_fall or (
+            exceptional_single_drop and not strong_immediate_rebound
         ):
             return interval_idx
+
     return None
-
-
-def _find_two_sided_point_b(
-    slopes: np.ndarray,
-    max_local_idx: int,
-    rise_plateau_limit: float,
-) -> int | None:
-    """Find B from rise on the A-side and purge on the maximum-side.
-
-    Candidate point i must have an active positive-rise interval immediately
-    before it and a low-slope purge interval immediately after it. The search runs
-    A -> maximum and deliberately keeps the last valid candidate so an early
-    near-threshold slope change does not become B when a later, cleaner
-    rise-to-purge boundary exists.
-    """
-    point_b_local_idx: int | None = None
-    for point_idx in range(1, int(max_local_idx) + 1):
-        if point_idx >= len(slopes):
-            break
-
-        rise_before = float(slopes[point_idx - 1]) > rise_plateau_limit
-        purge_after = abs(float(slopes[point_idx])) <= rise_plateau_limit
-        if rise_before and purge_after:
-            point_b_local_idx = point_idx
-
-    return point_b_local_idx
-
-
-def _find_two_sided_point_c(
-    slopes: np.ndarray,
-    max_local_idx: int,
-    fall_plateau_limit: float,
-    fall_reference: float,
-) -> int | None:
-    """Find C from purge on the maximum-side and fall on the D-side.
-
-    The search runs D -> maximum. A candidate point must have a low-slope purge
-    interval immediately on its maximum-side and a real fall beginning on its
-    D-side. The loop keeps the last valid candidate encountered in this reverse
-    direction, which is the earliest valid purge-to-fall boundary in forward time.
-    This prevents a later post-drop flat segment from replacing the true C.
-    """
-    point_c_local_idx: int | None = None
-    for point_idx in range(len(slopes) - 1, int(max_local_idx) - 1, -1):
-        if point_idx <= 0:
-            continue
-
-        purge_before = abs(float(slopes[point_idx - 1])) <= fall_plateau_limit
-        fall_after = _fall_transition_condition(
-            slopes=slopes,
-            interval_idx=point_idx,
-            plateau_limit=fall_plateau_limit,
-            fall_reference=fall_reference,
-        )
-        if purge_before and fall_after:
-            point_c_local_idx = point_idx
-
-    return point_c_local_idx
 
 
 def _detect_plateau_transition_indices(
@@ -387,19 +319,18 @@ def _detect_plateau_transition_indices(
     plateau_fraction: float = 0.35,
     polyorder: int = 2,
 ) -> tuple[int, int] | None:
-    """Locate B and C as two-sided regime boundaries around the purge region.
+    """Locate B and C around the purge/plateau near the maximum.
 
-    B is accepted only when the A-side still behaves like an active rise and the
-    maximum-side behaves like low-slope purge. Scanning A -> maximum keeps the
-    last valid rise-to-purge boundary.
+    B is the left edge of the low-slope purge region after the active rise.
 
-    C is accepted only when the maximum-side still behaves like purge and the
-    D-side begins a real fall. Scanning D -> maximum keeps the last valid boundary
-    encountered in reverse time, which is the earliest valid purge-to-fall
-    boundary in forward time.
+    C is asymmetric on purpose. Starting at the maximum, the detector accepts
+    either (1) the first two-interval sustained negative fall or (2) one clearly
+    instantaneous drop whose magnitude reaches the representative active-fall
+    rate and is not immediately reversed by a comparably strong rebound.
 
-    A direct rise-to-fall trace with no resolved purge may still use B = C = the
-    maximum anchor when both transition sides are unambiguous there.
+    This preserves a true one-sample reaction while ignoring ordinary isolated
+    downward excursions during purge. If the trace changes directly from rise to
+    a real fall, B and C may both equal the maximum.
     """
     if not (0.01 <= float(plateau_fraction) <= 0.95):
         return None
@@ -456,36 +387,26 @@ def _detect_plateau_transition_indices(
     rise_plateau_limit = float(plateau_fraction) * rise_reference
     fall_plateau_limit = float(plateau_fraction) * fall_reference
 
-    point_b_local_idx = _find_two_sided_point_b(
+    left_interval_idx = max_local_idx - 1
+    while (
+        left_interval_idx >= 0
+        and abs(interval_slopes[left_interval_idx]) <= rise_plateau_limit
+    ):
+        left_interval_idx -= 1
+    point_b_local_idx = left_interval_idx + 1
+
+    point_c_local_idx = _find_fall_onset_interval(
         slopes=interval_slopes,
-        max_local_idx=max_local_idx,
-        rise_plateau_limit=rise_plateau_limit,
-    )
-    point_c_local_idx = _find_two_sided_point_c(
-        slopes=interval_slopes,
-        max_local_idx=max_local_idx,
-        fall_plateau_limit=fall_plateau_limit,
+        plateau_limit=fall_plateau_limit,
         fall_reference=fall_reference,
+        start_idx=max_local_idx,
     )
+    if point_c_local_idx is None:
+        return None
 
-    # Preserve the physically valid no-resolved-purge case. Both sides must be
-    # direct at the maximum; otherwise an unresolved two-sided boundary is rejected.
-    if point_b_local_idx is None and point_c_local_idx is None:
-        direct_rise_before = (
-            max_local_idx > 0
-            and float(interval_slopes[max_local_idx - 1]) > rise_plateau_limit
-        )
-        direct_fall_after = _fall_transition_condition(
-            slopes=interval_slopes,
-            interval_idx=max_local_idx,
-            plateau_limit=fall_plateau_limit,
-            fall_reference=fall_reference,
-        )
-        if direct_rise_before and direct_fall_after:
-            point_b_local_idx = max_local_idx
-            point_c_local_idx = max_local_idx
-
-    if point_b_local_idx is None or point_c_local_idx is None:
+    if point_b_local_idx <= 0:
+        return None
+    if not np.any(left_slopes[:point_b_local_idx] > rise_plateau_limit):
         return None
 
     if not (
@@ -570,15 +491,14 @@ def calculate_cycles(
     transition_polyorder: int = 2,
     transition_min_width: float | None = None,
 ) -> CycleAnalysisResult:
-    """Calculate cycles using two-sided rise/purge and purge/fall boundaries.
+    """Calculate max-anchored cycles using purge entry B and fall-onset C.
 
-    A and D are successive minima and the detected maximum anchors the purge:
-      - B = last valid rise-to-purge boundary when scanning A -> maximum
-      - C = last valid fall-to-purge boundary when scanning D -> maximum
-            (equivalently, earliest valid purge-to-fall boundary forward in time)
+    A and D are successive minima. The detected maximum anchors the purge region:
+      - B = left edge of the low-slope plateau after the active rise
+      - C = first sustained active fall, or one clearly instantaneous strong drop
 
-    The maximum may equal B, C, or both. A cycle is rejected when either two-sided
-    regime boundary cannot be resolved, except for the direct rise-to-fall case.
+    The maximum may equal B, C, or both. A cycle is rejected when a meaningful
+    rise or fall cannot be resolved.
     """
     del transition_persistence, transition_min_width
 
