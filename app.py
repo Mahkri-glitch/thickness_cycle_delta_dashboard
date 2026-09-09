@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import inspect
 import io
@@ -147,6 +148,29 @@ def classify_time_order(df: pd.DataFrame, time_col: str) -> str:
     return "mixed"
 
 
+def _recovery_issue_key(issue: dict) -> str:
+    return (
+        f"{issue['Missing Type']}:"
+        f"{int(issue['Start Index'])}:"
+        f"{int(issue['End Index'])}"
+    )
+
+
+def _approx_cycle_number(issue: dict, base_min_indices: np.ndarray) -> int:
+    """Return a stable approximate cycle number for a broken extrema region."""
+    start_idx = int(issue["Start Index"])
+    completed_starts = int(np.count_nonzero(base_min_indices <= start_idx))
+    return max(1, completed_starts)
+
+
+def _candidate_index(recovery, missing_type: str) -> int | None:
+    if missing_type == "min" and recovery.recovered_min_indices:
+        return int(recovery.recovered_min_indices[0])
+    if missing_type == "max" and recovery.recovered_max_indices:
+        return int(recovery.recovered_max_indices[0])
+    return None
+
+
 def plot_full_dataset(df, time_col, thickness_col, start_time, end_time) -> None:
     x = df[time_col].to_numpy(dtype=float)
     y = df[thickness_col].to_numpy(dtype=float)
@@ -188,7 +212,7 @@ def plot_cycle_analysis(
             time_values[int(selected_issue["Start Index"])],
             time_values[int(selected_issue["End Index"])],
             alpha=0.12,
-            label="Suspected missing-point region",
+            label="Selected missing-point region",
         )
 
     ax.plot(
@@ -244,7 +268,7 @@ def plot_cycle_analysis(
             thickness_values[point_c_indices],
             s=110,
             marker="^",
-            label="Point C (purge plateau exit)",
+            label="Point C (fall onset)",
         )
     if recovered_point_b_indices:
         ax.scatter(
@@ -266,6 +290,108 @@ def plot_cycle_analysis(
     ax.set_title("ALD/ALE Process Delta Analyzer")
     ax.set_xlabel(time_col)
     ax.set_ylabel(thickness_col)
+    ax.legend()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def plot_missing_point_region(
+    issue: dict,
+    time_values: np.ndarray,
+    thickness_values: np.ndarray,
+    base_min_indices: np.ndarray,
+    base_max_indices: np.ndarray,
+    preview_candidate_idx: int | None,
+    saved_candidate_idx: int | None,
+    time_col: str,
+    thickness_col: str,
+    padding_points: int = 8,
+) -> None:
+    """Zoom into one broken extrema region and show preview/saved recovery points."""
+    start_idx = int(issue["Start Index"])
+    end_idx = int(issue["End Index"])
+    left_idx = max(0, start_idx - int(padding_points))
+    right_idx = min(len(time_values) - 1, end_idx + int(padding_points))
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(
+        time_values[left_idx : right_idx + 1],
+        thickness_values[left_idx : right_idx + 1],
+        linewidth=2,
+        label="Thickness",
+    )
+    ax.axvspan(
+        time_values[start_idx],
+        time_values[end_idx],
+        alpha=0.10,
+        label="Local recovery search region",
+    )
+
+    local_mins = base_min_indices[
+        (base_min_indices >= left_idx) & (base_min_indices <= right_idx)
+    ]
+    local_maxs = base_max_indices[
+        (base_max_indices >= left_idx) & (base_max_indices <= right_idx)
+    ]
+    if len(local_mins):
+        ax.scatter(
+            time_values[local_mins],
+            thickness_values[local_mins],
+            s=90,
+            marker="o",
+            label="Global minima",
+        )
+    if len(local_maxs):
+        ax.scatter(
+            time_values[local_maxs],
+            thickness_values[local_maxs],
+            s=90,
+            marker="s",
+            label="Global maxima",
+        )
+
+    if saved_candidate_idx is not None:
+        ax.scatter(
+            [time_values[saved_candidate_idx]],
+            [thickness_values[saved_candidate_idx]],
+            s=210,
+            marker="P",
+            label="Saved recovered point",
+        )
+        ax.annotate(
+            "SAVED",
+            (time_values[saved_candidate_idx], thickness_values[saved_candidate_idx]),
+            xytext=(0, 24),
+            textcoords="offset points",
+            ha="center",
+            fontweight="bold",
+        )
+
+    if (
+        preview_candidate_idx is not None
+        and preview_candidate_idx != saved_candidate_idx
+    ):
+        ax.scatter(
+            [time_values[preview_candidate_idx]],
+            [thickness_values[preview_candidate_idx]],
+            s=180,
+            marker="X",
+            label="Current local-order preview",
+        )
+        ax.annotate(
+            "PREVIEW",
+            (time_values[preview_candidate_idx], thickness_values[preview_candidate_idx]),
+            xytext=(0, -28),
+            textcoords="offset points",
+            ha="center",
+            fontweight="bold",
+        )
+
+    missing_type = str(issue["Missing Type"]).upper()
+    ax.set_title(f"Missing-point region: possible missing {missing_type}")
+    ax.set_xlabel(time_col)
+    ax.set_ylabel(thickness_col)
+    ax.grid(alpha=0.2)
     ax.legend()
     st.pyplot(fig)
     plt.close(fig)
@@ -302,7 +428,7 @@ def plot_selected_cycle(
             time_values[b_idx],
             time_values[c_idx],
             alpha=0.10,
-            label="Detected purge plateau",
+            label="Detected purge region",
         )
 
     point_specs = [
@@ -352,7 +478,7 @@ sequences in forward physical time.
 - **Point A** = first minimum
 - **Point B** = entry into the low-slope purge/plateau after the active rise
 - **Maximum anchor** = a reference point inside or at an edge of the purge region
-- **Point C** = exit from the low-slope purge/plateau before the active fall
+- **Point C** = onset of the active fall after purge
 - **Point D** = next minimum
 - **Δ1 = B − A**
 - **Δ2 = B − C**
@@ -363,29 +489,28 @@ be a separate process point: it may equal B, C, or both if that is what the
 sampled trace resolves.
 
 **Transition detection**  
-The program lightly smooths A → D, calculates the slope between adjacent samples,
-and uses the active rise before the maximum and active fall after it as reference
-rates. Starting at the maximum, it expands left and right through the contiguous
-**low-slope region**. Those two edges are B and C.
-
-This is meant to capture the purge step even when it has a slight positive or
-negative drift instead of a perfectly flat plateau.
+B is found from the low-slope purge region after the active rise. C is intentionally
+asymmetric: it is the first sustained two-interval fall, or one exceptionally
+strong single drop when the reaction is resolved in only one sampling interval.
 
 **Smoothing window**  
 The minimum is **3 samples** so short ellipsometry transitions are not
 unnecessarily smeared.
 
 **Purge plateau threshold**  
-This is the largest slope magnitude that can still count as part of the purge
-plateau, expressed as a percentage of the active rise/fall rate. Lower values
-require a flatter purge. Higher values allow more gradual drift and produce a
-wider B → C region.
+This controls how much local slope can still count as purge relative to the active
+rise/fall rate.
 
 **Individual cycle inspector**  
 For long datasets, select any accepted cycle below the main plot to see a zoomed
 view with the exact **A, B, maximum anchor, C, and D** used for the calculations.
-The inspector does not re-run or change the detector; it only visualizes the
-stored cycle result.
+
+**Per-region missing-point recovery**  
+Broken **MAX → MAX** or **MIN → MIN** regions can each have their own local extrema
+order. Changing the local order previews a candidate only in that region. Use
+**Save/apply this local order** to keep that order while you tune other regions.
+Saved local orders are reapplied independently during the current Streamlit
+session and do not change the global minimum/maximum orders.
 
 **Time direction**  
 Uploaded data are automatically sorted by the selected time column before
@@ -395,11 +520,6 @@ analysis.
 For Excel files, the dashboard scans the first 30 rows for separate time and
 thickness header cells. A title such as **Thickness vs Time** in one cell is
 ignored.
-
-**Missing-point recovery**  
-MAX → MAX suggests a missing minimum; MIN → MIN suggests a missing maximum.
-Recovery searches locally and adds one candidate without deleting existing
-extrema.
             """
         )
 
@@ -549,58 +669,184 @@ plateau_percent = st.sidebar.slider(
     step=5,
     help=(
         "Lower values require a flatter purge region. Higher values allow more "
-        "positive/negative drift and widen the B-to-C plateau region."
+        "positive/negative drift in the purge region."
     ),
 )
 transition_onset_fraction = plateau_percent / 100.0
 
-min_indices, max_indices = detect_extrema(thickness_values, min_order, max_order)
-primary_events = build_events(min_indices, max_indices, time_values, thickness_values)
+# Global extrema establish the base event sequence. Local recovery never changes
+# these global orders; saved overrides are layered on afterward.
+base_min_indices, base_max_indices = detect_extrema(
+    thickness_values, min_order, max_order
+)
+primary_events = build_events(
+    base_min_indices, base_max_indices, time_values, thickness_values
+)
 suspect_regions = find_suspect_regions(primary_events)
 
+min_indices = base_min_indices.copy()
+max_indices = base_max_indices.copy()
 recovered_min_indices: list[int] = []
 recovered_max_indices: list[int] = []
 selected_issue: dict | None = None
+selected_preview_candidate_idx: int | None = None
+selected_saved_candidate_idx: int | None = None
+selected_issue_saved_order: int | None = None
+selected_issue_approx_cycle: int | None = None
+
+# Saved orders are scoped to the uploaded file + selected analysis window/columns.
+file_token = hashlib.sha1(file_bytes).hexdigest()[:12]
+recovery_context_key = (
+    f"{file_token}:{window_start}:{window_end}:"
+    f"{str(time_col)}:{str(thickness_col)}"
+)
+if "local_recovery_profiles" not in st.session_state:
+    st.session_state["local_recovery_profiles"] = {}
+all_recovery_profiles = st.session_state["local_recovery_profiles"]
+saved_recovery_orders = all_recovery_profiles.setdefault(recovery_context_key, {})
 
 st.sidebar.header("Missing Point Recovery")
 use_recovery = st.sidebar.checkbox("Enable missing-point recovery", value=False)
 
 if use_recovery:
+    current_issue_keys = {_recovery_issue_key(issue) for issue in suspect_regions}
+    active_saved_count = sum(
+        1 for key in saved_recovery_orders if key in current_issue_keys
+    )
+    if active_saved_count:
+        st.sidebar.caption(f"{active_saved_count} saved local recovery order(s) active.")
+
     if not suspect_regions:
         st.sidebar.caption("No broken MIN/MAX alternation was detected.")
     else:
         issue_number = st.sidebar.selectbox(
-            "Suspected missing point",
+            "Missing-point region",
             list(range(len(suspect_regions))),
             format_func=lambda idx: (
-                f"Issue {idx + 1}: missing {suspect_regions[idx]['Missing Type'].upper()} "
-                f"between t={suspect_regions[idx]['Start Time']:.3f} and "
-                f"t={suspect_regions[idx]['End Time']:.3f}"
+                f"~Cycle {_approx_cycle_number(suspect_regions[idx], base_min_indices)}: "
+                f"missing {suspect_regions[idx]['Missing Type'].upper()} "
+                f"({suspect_regions[idx]['Start Time']:.3f}–"
+                f"{suspect_regions[idx]['End Time']:.3f})"
+                + (
+                    " • saved"
+                    if _recovery_issue_key(suspect_regions[idx]) in saved_recovery_orders
+                    else ""
+                )
             ),
+            key="missing_point_region_selector",
         )
         selected_issue = suspect_regions[issue_number]
-        missing_type = selected_issue["Missing Type"]
+        selected_issue_key = _recovery_issue_key(selected_issue)
+        selected_issue_approx_cycle = _approx_cycle_number(
+            selected_issue, base_min_indices
+        )
+        missing_type = str(selected_issue["Missing Type"])
+        global_default_order = min_order if missing_type == "min" else max_order
+        selected_issue_saved_order = saved_recovery_orders.get(selected_issue_key)
+        slider_default = int(
+            selected_issue_saved_order
+            if selected_issue_saved_order is not None
+            else global_default_order
+        )
+        slider_key = (
+            f"local_recovery_order:{recovery_context_key}:{selected_issue_key}"
+        )
+        if slider_key not in st.session_state:
+            st.session_state[slider_key] = slider_default
+
         recovery_order = st.sidebar.slider(
-            f"Local {missing_type} order",
+            f"Local {missing_type} order for this region",
             min_value=1,
             max_value=max_allowed_order,
-            value=min_order if missing_type == "min" else max_order,
             step=1,
+            key=slider_key,
+            help=(
+                "This order is used only inside the selected broken region. "
+                "Move the slider to preview the candidate, then save/apply it."
+            ),
         )
+
+        preview_recovery = recover_missing_extremum(
+            thickness_values=thickness_values,
+            min_indices=base_min_indices,
+            max_indices=base_max_indices,
+            issue=selected_issue,
+            recovery_order=int(recovery_order),
+        )
+        selected_preview_candidate_idx = _candidate_index(
+            preview_recovery, missing_type
+        )
+
+        if selected_issue_saved_order is not None:
+            saved_preview = recover_missing_extremum(
+                thickness_values=thickness_values,
+                min_indices=base_min_indices,
+                max_indices=base_max_indices,
+                issue=selected_issue,
+                recovery_order=int(selected_issue_saved_order),
+            )
+            selected_saved_candidate_idx = _candidate_index(
+                saved_preview, missing_type
+            )
+
+        save_col, reset_col = st.sidebar.columns(2)
+        with save_col:
+            save_local = st.button(
+                "Save/apply",
+                key=f"save_local_recovery:{recovery_context_key}:{selected_issue_key}",
+                use_container_width=True,
+            )
+        with reset_col:
+            reset_local = st.button(
+                "Reset region",
+                key=f"reset_local_recovery:{recovery_context_key}:{selected_issue_key}",
+                use_container_width=True,
+            )
+
+        if save_local:
+            if selected_preview_candidate_idx is None:
+                st.sidebar.warning(
+                    "This local order does not produce a recovery candidate."
+                )
+            else:
+                saved_recovery_orders[selected_issue_key] = int(recovery_order)
+                st.rerun()
+
+        if reset_local:
+            saved_recovery_orders.pop(selected_issue_key, None)
+            st.session_state.pop(slider_key, None)
+            st.rerun()
+
+        if saved_recovery_orders and st.sidebar.button(
+            "Clear all saved local recoveries",
+            key=f"clear_local_recoveries:{recovery_context_key}",
+            use_container_width=True,
+        ):
+            saved_recovery_orders.clear()
+            st.rerun()
+
+    # Apply every saved local override independently. Unsaved slider previews do
+    # not alter the cycle calculation.
+    for issue in suspect_regions:
+        issue_key = _recovery_issue_key(issue)
+        if issue_key not in saved_recovery_orders:
+            continue
+
+        saved_order = int(saved_recovery_orders[issue_key])
         recovery = recover_missing_extremum(
             thickness_values=thickness_values,
             min_indices=min_indices,
             max_indices=max_indices,
-            issue=selected_issue,
-            recovery_order=recovery_order,
+            issue=issue,
+            recovery_order=saved_order,
         )
         min_indices = recovery.min_indices
         max_indices = recovery.max_indices
-        recovered_min_indices = recovery.recovered_min_indices
-        recovered_max_indices = recovery.recovered_max_indices
+        recovered_min_indices.extend(recovery.recovered_min_indices)
+        recovered_max_indices.extend(recovery.recovered_max_indices)
 
-        if not recovered_min_indices and not recovered_max_indices:
-            st.sidebar.warning("No local candidate was found in this gap.")
+    recovered_min_indices = sorted(set(recovered_min_indices))
+    recovered_max_indices = sorted(set(recovered_max_indices))
 
 events = build_events(min_indices, max_indices, time_values, thickness_values)
 
@@ -654,6 +900,77 @@ plot_cycle_analysis(
     selected_issue,
 )
 
+if use_recovery and selected_issue is not None:
+    st.subheader("Inspect Missing-Point Region")
+    st.caption(
+        f"Approximate cycle {selected_issue_approx_cycle}: possible missing "
+        f"{str(selected_issue['Missing Type']).upper()}. The preview marker follows "
+        "the current local-order slider; only the saved marker is used in analysis."
+    )
+    missing_padding = st.slider(
+        "Missing-region padding (samples)",
+        min_value=0,
+        max_value=50,
+        value=8,
+        step=1,
+        key=f"missing_region_padding:{recovery_context_key}",
+    )
+    plot_missing_point_region(
+        issue=selected_issue,
+        time_values=time_values,
+        thickness_values=thickness_values,
+        base_min_indices=base_min_indices,
+        base_max_indices=base_max_indices,
+        preview_candidate_idx=selected_preview_candidate_idx,
+        saved_candidate_idx=selected_saved_candidate_idx,
+        time_col=time_col,
+        thickness_col=thickness_col,
+        padding_points=missing_padding,
+    )
+
+    if selected_preview_candidate_idx is None:
+        st.warning(
+            "The current local order does not produce a candidate in this region."
+        )
+    elif selected_issue_saved_order is None:
+        st.info(
+            "A candidate is previewed above. Save/apply the local order to include "
+            "that recovered point in cycle detection."
+        )
+
+    if selected_saved_candidate_idx is not None:
+        missing_type = str(selected_issue["Missing Type"])
+        if missing_type == "max":
+            recovered_cycle_rows = cycle_df.loc[
+                cycle_df["Max Anchor Index"] == selected_saved_candidate_idx
+            ]
+        else:
+            recovered_cycle_rows = cycle_df.loc[
+                (cycle_df["Point A Index"] == selected_saved_candidate_idx)
+                | (cycle_df["Point D Index"] == selected_saved_candidate_idx)
+            ]
+
+        if not recovered_cycle_rows.empty:
+            recovered_cycle_row = recovered_cycle_rows.iloc[0]
+            recovered_cycle_number = int(recovered_cycle_row["Cycle"])
+            st.success(
+                f"This saved recovery contributes to accepted Cycle "
+                f"{recovered_cycle_number}."
+            )
+            plot_selected_cycle(
+                cycle_row=recovered_cycle_row,
+                time_values=time_values,
+                thickness_values=thickness_values,
+                time_col=time_col,
+                thickness_col=thickness_col,
+                padding_points=5,
+            )
+        else:
+            st.caption(
+                "The recovered extremum is saved, but this region does not yet form "
+                "an accepted A/B/M/C/D cycle under the current transition settings."
+            )
+
 st.subheader("Analysis Diagnostics")
 row1 = st.columns(4)
 row1[0].metric("Full data points", len(full_df))
@@ -665,16 +982,27 @@ row2 = st.columns(4)
 row2[0].metric("Detected minima", len(min_indices))
 row2[1].metric("Maximum anchors", len(max_indices))
 row2[2].metric("Rejected sequences", result.rejected_sequences)
-row2[3].metric("Plateau failures", result.derivative_failures)
+row2[3].metric("Transition failures", result.derivative_failures)
+
+if use_recovery:
+    active_saved_keys = {
+        _recovery_issue_key(issue) for issue in suspect_regions
+    } & set(saved_recovery_orders)
+    st.caption(
+        f"Applied local recoveries: {len(active_saved_keys)} region(s); "
+        f"recovered minima: {len(recovered_min_indices)}, "
+        f"recovered maxima: {len(recovered_max_indices)}."
+    )
 
 if len(cycle_df) > 0:
     st.success(
-        f"{len(cycle_df)} complete cycles with purge plateau boundaries were identified."
+        f"{len(cycle_df)} complete cycles with purge/fall boundaries were identified."
     )
 else:
     st.warning(
-        "No complete cycles with valid purge plateau boundaries were detected. "
-        "Adjust the analysis window, extrema orders, plateau threshold, or smoothing."
+        "No complete cycles with valid purge/fall boundaries were detected. "
+        "Adjust the analysis window, extrema orders, local recoveries, plateau "
+        "threshold, or smoothing."
     )
 
 st.subheader("Δ1, Δ2, and Δ3 by cycle")
