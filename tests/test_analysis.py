@@ -178,6 +178,62 @@ def test_single_strong_drop_can_define_point_c():
     assert transitions == (3, 6)
 
 
+def test_transition_band_ignores_near_max_blip_for_point_b():
+    slopes = np.array([1.0, 1.0, 1.0, 0.45, 0.10, 0.10, 0.50, 0.10, -1.0])
+    thickness = np.cumsum(np.r_[0.0, slopes])
+    time = np.arange(len(thickness), dtype=float)
+
+    transitions = _detect_plateau_transition_indices(
+        time,
+        thickness,
+        min1_idx=0,
+        max_idx=8,
+        min2_idx=9,
+        smoothing_window=3,
+        plateau_fraction=0.35,
+    )
+
+    assert transitions == (4, 8)
+
+
+def test_transition_band_moves_c_through_gradual_purge_drift():
+    # Cycle-143-style shape: two clearly purge-like intervals after M, then
+    # several moderate negative slopes, followed by an unmistakable active fall.
+    slopes = np.array(
+        [
+            1.0,
+            1.0,
+            1.0,
+            0.05,
+            0.02,
+            -0.02,
+            -0.02,
+            -0.20,
+            -0.20,
+            -0.20,
+            -0.25,
+            -2.00,
+            -0.50,
+            -0.50,
+            -0.10,
+        ]
+    )
+    thickness = np.cumsum(np.r_[0.0, slopes])
+    time = np.arange(len(thickness), dtype=float)
+
+    transitions = _detect_plateau_transition_indices(
+        time,
+        thickness,
+        min1_idx=0,
+        max_idx=5,
+        min2_idx=15,
+        smoothing_window=3,
+        plateau_fraction=0.35,
+    )
+
+    assert transitions == (3, 9)
+
+
 def test_maximum_can_be_b_and_c_when_no_plateau_is_resolved():
     time = np.arange(7, dtype=float)
     thickness = np.array([0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 0.0], dtype=float)
