@@ -309,6 +309,158 @@ def _find_fall_onset_interval(
     return None
 
 
+def _first_sustained_true_run(
+    mask: np.ndarray,
+    start_idx: int,
+    stop_idx: int,
+) -> tuple[int, int] | None:
+    """Return the first two-interval True run in [start_idx, stop_idx)."""
+    start = max(0, int(start_idx))
+    stop = min(len(mask), int(stop_idx))
+    for interval_idx in range(start, max(start, stop - 1)):
+        if bool(mask[interval_idx]) and bool(mask[interval_idx + 1]):
+            return interval_idx, interval_idx + 1
+    return None
+
+
+def _last_sustained_true_run(
+    mask: np.ndarray,
+    start_idx: int,
+    stop_idx: int,
+) -> tuple[int, int] | None:
+    """Return the last two-interval True run in [start_idx, stop_idx)."""
+    start = max(0, int(start_idx))
+    stop = min(len(mask), int(stop_idx))
+    last_run: tuple[int, int] | None = None
+    for interval_idx in range(start, max(start, stop - 1)):
+        if bool(mask[interval_idx]) and bool(mask[interval_idx + 1]):
+            last_run = (interval_idx, interval_idx + 1)
+    return last_run
+
+
+def _refine_point_b_with_transition_band(
+    slopes: np.ndarray,
+    max_local_idx: int,
+    plateau_limit: float,
+    active_limit: float,
+    baseline_b_idx: int,
+) -> int:
+    """Move B only outward into a sustained rise -> purge ambiguity band.
+
+    The original B remains the baseline. A refinement is made only when there is
+    a sustained active-rise run and a later sustained purge run. Any intervals
+    between those two stable regimes form the transition band. Its midpoint is
+    used, with an even-width tie biased toward the maximum/purge side.
+
+    Because the final result is min(baseline, candidate), this layer can correct
+    a near-maximum blip that pulled the original B inward, but it cannot shrink
+    the M/purge region compared with the established detector.
+    """
+    pre_max_slopes = np.asarray(slopes[:max_local_idx], dtype=float)
+    if len(pre_max_slopes) < 2:
+        return int(baseline_b_idx)
+
+    active_mask = pre_max_slopes >= float(active_limit)
+    purge_mask = np.abs(pre_max_slopes) <= float(plateau_limit)
+
+    active_run = _last_sustained_true_run(active_mask, 0, len(pre_max_slopes))
+    if active_run is None:
+        return int(baseline_b_idx)
+
+    active_end = int(active_run[1])
+    purge_run = _first_sustained_true_run(
+        purge_mask,
+        active_end + 1,
+        len(pre_max_slopes),
+    )
+    if purge_run is None:
+        return int(baseline_b_idx)
+
+    purge_start = int(purge_run[0])
+    active_side_point = active_end + 1
+    purge_side_point = purge_start
+    if active_side_point > purge_side_point:
+        return int(baseline_b_idx)
+
+    transition_midpoint = (active_side_point + purge_side_point + 1) // 2
+    return min(int(baseline_b_idx), int(transition_midpoint))
+
+
+def _find_confirmed_active_fall_start(
+    slopes: np.ndarray,
+    start_idx: int,
+    active_limit: float,
+    fall_reference: float,
+) -> int | None:
+    """Find a clearly active fall, preserving the established single-drop path."""
+    for interval_idx in range(int(start_idx), len(slopes)):
+        current_slope = float(slopes[interval_idx])
+        sustained_active_fall = (
+            interval_idx + 1 < len(slopes)
+            and current_slope <= -active_limit
+            and slopes[interval_idx + 1] <= -active_limit
+        )
+        exceptional_single_drop = current_slope <= -fall_reference
+        strong_immediate_rebound = (
+            interval_idx + 1 < len(slopes)
+            and slopes[interval_idx + 1] >= fall_reference
+        )
+
+        if sustained_active_fall or (
+            exceptional_single_drop and not strong_immediate_rebound
+        ):
+            return interval_idx
+    return None
+
+
+def _refine_point_c_with_transition_band(
+    slopes: np.ndarray,
+    max_local_idx: int,
+    plateau_limit: float,
+    active_limit: float,
+    fall_reference: float,
+    baseline_c_idx: int,
+) -> int:
+    """Move C only outward through a sustained purge -> fall ambiguity band.
+
+    The original sustained/single-drop C remains the baseline. A later refinement
+    is used only when a sustained purge regime is followed by a clearly active
+    fall. The samples between those stable regimes form an unresolved transition
+    band. Its midpoint is used, with an even-width tie biased toward the
+    maximum/purge side.
+
+    Returning max(baseline, candidate) means ordinary noise cannot move C back
+    toward the maximum, while gradual purge drift can no longer be mistaken for
+    the beginning of the true active fall.
+    """
+    active_start = _find_confirmed_active_fall_start(
+        slopes=slopes,
+        start_idx=max_local_idx,
+        active_limit=active_limit,
+        fall_reference=fall_reference,
+    )
+    if active_start is None or active_start <= max_local_idx:
+        return int(baseline_c_idx)
+
+    purge_mask = np.abs(slopes) <= float(plateau_limit)
+    purge_run = _last_sustained_true_run(
+        purge_mask,
+        max_local_idx,
+        active_start,
+    )
+    if purge_run is None:
+        return int(baseline_c_idx)
+
+    purge_end = int(purge_run[1])
+    purge_side_point = purge_end + 1
+    active_side_point = int(active_start)
+    if purge_side_point > active_side_point:
+        return int(baseline_c_idx)
+
+    transition_midpoint = (purge_side_point + active_side_point) // 2
+    return max(int(baseline_c_idx), int(transition_midpoint))
+
+
 def _detect_plateau_transition_indices(
     time_values: np.ndarray,
     thickness_values: np.ndarray,
@@ -319,18 +471,18 @@ def _detect_plateau_transition_indices(
     plateau_fraction: float = 0.35,
     polyorder: int = 2,
 ) -> tuple[int, int] | None:
-    """Locate B and C around the purge/plateau near the maximum.
+    """Locate B and C using the established detector plus transition-band refinement.
 
-    B is the left edge of the low-slope purge region after the active rise.
+    The original logic is retained as the baseline:
+      - B = left edge of the low-slope purge region after the active rise
+      - C = first sustained active fall, or one clearly instantaneous strong drop
 
-    C is asymmetric on purpose. Starting at the maximum, the detector accepts
-    either (1) the first two-interval sustained negative fall or (2) one clearly
-    instantaneous drop whose magnitude reaches the representative active-fall
-    rate and is not immediately reversed by a comparably strong rebound.
-
-    This preserves a true one-sample reaction while ignoring ordinary isolated
-    downward excursions during purge. If the trace changes directly from rise to
-    a real fall, B and C may both equal the maximum.
+    A second, conservative layer handles multi-sample ambiguous boundaries. It
+    requires stable regimes on both sides, ignores isolated blips, and places the
+    point near the middle of the unresolved transition band. The refinement is
+    one-way: B may move earlier and C may move later, so ambiguous samples are
+    preferentially absorbed into the M/purge region rather than into Delta 1 or
+    Delta 3. If no stable transition band exists, the original B/C are unchanged.
     """
     if not (0.01 <= float(plateau_fraction) <= 0.95):
         return None
@@ -393,16 +545,35 @@ def _detect_plateau_transition_indices(
         and abs(interval_slopes[left_interval_idx]) <= rise_plateau_limit
     ):
         left_interval_idx -= 1
-    point_b_local_idx = left_interval_idx + 1
+    baseline_b_local_idx = left_interval_idx + 1
 
-    point_c_local_idx = _find_fall_onset_interval(
+    baseline_c_local_idx = _find_fall_onset_interval(
         slopes=interval_slopes,
         plateau_limit=fall_plateau_limit,
         fall_reference=fall_reference,
         start_idx=max_local_idx,
     )
-    if point_c_local_idx is None:
+    if baseline_c_local_idx is None:
         return None
+
+    rise_active_limit = (1.0 - float(plateau_fraction)) * rise_reference
+    fall_active_limit = (1.0 - float(plateau_fraction)) * fall_reference
+
+    point_b_local_idx = _refine_point_b_with_transition_band(
+        slopes=interval_slopes,
+        max_local_idx=max_local_idx,
+        plateau_limit=rise_plateau_limit,
+        active_limit=rise_active_limit,
+        baseline_b_idx=baseline_b_local_idx,
+    )
+    point_c_local_idx = _refine_point_c_with_transition_band(
+        slopes=interval_slopes,
+        max_local_idx=max_local_idx,
+        plateau_limit=fall_plateau_limit,
+        active_limit=fall_active_limit,
+        fall_reference=fall_reference,
+        baseline_c_idx=baseline_c_local_idx,
+    )
 
     if point_b_local_idx <= 0:
         return None
@@ -494,11 +665,11 @@ def calculate_cycles(
     """Calculate max-anchored cycles using purge entry B and fall-onset C.
 
     A and D are successive minima. The detected maximum anchors the purge region:
-      - B = left edge of the low-slope plateau after the active rise
-      - C = first sustained active fall, or one clearly instantaneous strong drop
+      - B = rise -> purge transition, refined through any stable ambiguity band
+      - C = purge -> fall transition, refined through any stable ambiguity band
 
-    The maximum may equal B, C, or both. A cycle is rejected when a meaningful
-    rise or fall cannot be resolved.
+    The established B/C detector remains the baseline, and ambiguous samples are
+    included in the M/purge region only when sustained regimes support doing so.
     """
     del transition_persistence, transition_min_width
 
