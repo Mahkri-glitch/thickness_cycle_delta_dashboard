@@ -309,6 +309,49 @@ def _find_fall_onset_interval(
     return None
 
 
+def _one_sided_secant_slopes(
+    time_values: np.ndarray,
+    thickness_values: np.ndarray,
+    point_idx: int,
+    left_anchor_idx: int,
+    right_anchor_idx: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return matching left/right secant slopes approaching one candidate point.
+
+    Step k compares point_idx with point_idx-k on the left and point_idx+k on the
+    right. This mimics a discrete one-sided-limit check at progressively larger
+    distances. Only distances available on both sides are used.
+    """
+    radius = min(
+        int(point_idx) - int(left_anchor_idx),
+        int(right_anchor_idx) - int(point_idx),
+    )
+    if radius < 1:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+    left_secants: list[float] = []
+    right_secants: list[float] = []
+    for step in range(1, radius + 1):
+        left_dt = float(time_values[point_idx] - time_values[point_idx - step])
+        right_dt = float(time_values[point_idx + step] - time_values[point_idx])
+        if left_dt <= 0 or right_dt <= 0:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+        left_secants.append(
+            float(thickness_values[point_idx] - thickness_values[point_idx - step])
+            / left_dt
+        )
+        right_secants.append(
+            float(thickness_values[point_idx + step] - thickness_values[point_idx])
+            / right_dt
+        )
+
+    return (
+        np.asarray(left_secants, dtype=float),
+        np.asarray(right_secants, dtype=float),
+    )
+
+
 def _detect_plateau_transition_indices(
     time_values: np.ndarray,
     thickness_values: np.ndarray,
@@ -319,18 +362,21 @@ def _detect_plateau_transition_indices(
     plateau_fraction: float = 0.35,
     polyorder: int = 2,
 ) -> tuple[int, int] | None:
-    """Locate B and C around the purge/plateau near the maximum.
+    """Locate B and C from one-sided slope-limit discontinuities around the maximum.
 
-    B is the left edge of the low-slope purge region after the active rise.
+    B is a resolved rise -> purge boundary strictly between A and the maximum.
+    For every candidate, secant slopes are evaluated from matching distances on
+    both sides. The A-side limit must remain rise-like while the maximum-side
+    limit is purge-like.
 
-    C is asymmetric on purpose. Starting at the maximum, the detector accepts
-    either (1) the first two-interval sustained negative fall or (2) one clearly
-    instantaneous drop whose magnitude reaches the representative active-fall
-    rate and is not immediately reversed by a comparably strong rebound.
+    C is a resolved purge -> fall boundary strictly between the maximum and D.
+    The maximum-side limit must remain purge-like while the D-side limit is
+    fall-like. The immediate fall must also satisfy the established sustained- or
+    single-drop rule.
 
-    This preserves a true one-sample reaction while ignoring ordinary isolated
-    downward excursions during purge. If the trace changes directly from rise to
-    a real fall, B and C may both equal the maximum.
+    This keeps transition points out of the detected minima/maxima themselves.
+    If no separate B or C can be resolved, the cycle is rejected rather than
+    assigning a transition to an extremum.
     """
     if not (0.01 <= float(plateau_fraction) <= 0.95):
         return None
@@ -344,7 +390,7 @@ def _detect_plateau_transition_indices(
         thickness_values[min1_idx : min2_idx + 1], dtype=float
     )
 
-    if len(segment_time) < 3:
+    if len(segment_time) < 5:
         return None
     if not np.isfinite(segment_time).all() or not np.isfinite(segment_thickness).all():
         return None
@@ -366,6 +412,7 @@ def _detect_plateau_transition_indices(
     interval_slopes = np.diff(smoothed) / np.diff(segment_time)
 
     max_local_idx = max_idx - min1_idx
+    min2_local_idx = min2_idx - min1_idx
     left_slopes = interval_slopes[:max_local_idx]
     right_slopes = interval_slopes[max_local_idx:]
 
@@ -386,34 +433,75 @@ def _detect_plateau_transition_indices(
 
     rise_plateau_limit = float(plateau_fraction) * rise_reference
     fall_plateau_limit = float(plateau_fraction) * fall_reference
+    rise_discontinuity_limit = (1.0 - float(plateau_fraction)) * rise_reference
+    fall_discontinuity_limit = (1.0 - float(plateau_fraction)) * fall_reference
 
-    left_interval_idx = max_local_idx - 1
-    while (
-        left_interval_idx >= 0
-        and abs(interval_slopes[left_interval_idx]) <= rise_plateau_limit
-    ):
-        left_interval_idx -= 1
-    point_b_local_idx = left_interval_idx + 1
+    point_b_local_idx: int | None = None
+    for candidate_idx in range(1, max_local_idx):
+        left_limit_samples, right_limit_samples = _one_sided_secant_slopes(
+            time_values=segment_time,
+            thickness_values=smoothed,
+            point_idx=candidate_idx,
+            left_anchor_idx=0,
+            right_anchor_idx=max_local_idx,
+        )
+        if len(left_limit_samples) == 0:
+            continue
 
-    point_c_local_idx = _find_fall_onset_interval(
-        slopes=interval_slopes,
-        plateau_limit=fall_plateau_limit,
-        fall_reference=fall_reference,
-        start_idx=max_local_idx,
-    )
-    if point_c_local_idx is None:
-        return None
+        left_limit = float(np.median(left_limit_samples))
+        right_limit = float(np.median(right_limit_samples))
+        is_rise_to_purge = (
+            left_limit > rise_plateau_limit
+            and abs(right_limit) <= rise_plateau_limit
+            and (left_limit - right_limit) >= rise_discontinuity_limit
+        )
+        if is_rise_to_purge:
+            point_b_local_idx = candidate_idx
+            break
 
-    if point_b_local_idx <= 0:
-        return None
-    if not np.any(left_slopes[:point_b_local_idx] > rise_plateau_limit):
+    point_c_local_idx: int | None = None
+    for candidate_idx in range(max_local_idx + 1, min2_local_idx):
+        left_limit_samples, right_limit_samples = _one_sided_secant_slopes(
+            time_values=segment_time,
+            thickness_values=smoothed,
+            point_idx=candidate_idx,
+            left_anchor_idx=max_local_idx,
+            right_anchor_idx=min2_local_idx,
+        )
+        if len(left_limit_samples) == 0:
+            continue
+
+        left_limit = float(np.median(left_limit_samples))
+        right_limit = float(np.median(right_limit_samples))
+
+        immediate_fall_idx = candidate_idx
+        sustained_or_single_fall = (
+            _find_fall_onset_interval(
+                slopes=interval_slopes,
+                plateau_limit=fall_plateau_limit,
+                fall_reference=fall_reference,
+                start_idx=immediate_fall_idx,
+            )
+            == immediate_fall_idx
+        )
+        is_purge_to_fall = (
+            abs(left_limit) <= fall_plateau_limit
+            and right_limit < -fall_plateau_limit
+            and (left_limit - right_limit) >= fall_discontinuity_limit
+            and sustained_or_single_fall
+        )
+        if is_purge_to_fall:
+            point_c_local_idx = candidate_idx
+            break
+
+    if point_b_local_idx is None or point_c_local_idx is None:
         return None
 
     if not (
         0
         < point_b_local_idx
-        <= max_local_idx
-        <= point_c_local_idx
+        < max_local_idx
+        < point_c_local_idx
         < len(segment_time) - 1
     ):
         return None
@@ -491,14 +579,14 @@ def calculate_cycles(
     transition_polyorder: int = 2,
     transition_min_width: float | None = None,
 ) -> CycleAnalysisResult:
-    """Calculate max-anchored cycles using purge entry B and fall-onset C.
+    """Calculate max-anchored cycles using resolved B and C transition limits.
 
-    A and D are successive minima. The detected maximum anchors the purge region:
-      - B = left edge of the low-slope plateau after the active rise
-      - C = first sustained active fall, or one clearly instantaneous strong drop
+    A and D are successive minima and the detected maximum is an internal anchor:
+      - B = resolved rise -> purge slope-limit discontinuity
+      - C = resolved purge -> fall slope-limit discontinuity
 
-    The maximum may equal B, C, or both. A cycle is rejected when a meaningful
-    rise or fall cannot be resolved.
+    B and C must be distinct from A, the maximum, and D. A cycle is rejected when
+    those transition limits cannot be resolved.
     """
     del transition_persistence, transition_min_width
 
@@ -552,8 +640,8 @@ def calculate_cycles(
         if not (
             point_a_idx
             < point_b_idx
-            <= max_anchor_idx
-            <= point_c_idx
+            < max_anchor_idx
+            < point_c_idx
             < point_d_idx
         ):
             derivative_failures += 1
