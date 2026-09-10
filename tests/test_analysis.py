@@ -234,6 +234,30 @@ def test_transition_band_moves_c_through_gradual_purge_drift():
     assert transitions == (3, 9)
 
 
+def test_isolated_smoothing_prevents_post_max_drop_from_smearing_into_b():
+    # With whole-cycle SG smoothing, the extreme post-M drop can bend the fitted
+    # pre-M samples downward and collapse B onto M. A->M and M->D are now smoothed
+    # independently, so B remains at the actual rise->purge boundary while C=M is
+    # still valid because the fall genuinely begins immediately after the maximum.
+    time = np.arange(9, dtype=float)
+    thickness = np.array(
+        [0.0, 1.0, 2.0, 3.0, 3.10, 3.11, -5.0, -6.0, -7.0],
+        dtype=float,
+    )
+
+    transitions = _detect_plateau_transition_indices(
+        time,
+        thickness,
+        min1_idx=0,
+        max_idx=5,
+        min2_idx=8,
+        smoothing_window=5,
+        plateau_fraction=0.35,
+    )
+
+    assert transitions == (3, 5)
+
+
 def test_maximum_can_be_b_and_c_when_no_plateau_is_resolved():
     time = np.arange(7, dtype=float)
     thickness = np.array([0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 0.0], dtype=float)
