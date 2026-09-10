@@ -80,7 +80,7 @@ def test_missing_point_recovery_rejects_flat_shoulder():
     assert recovery.recovered_min_indices == []
 
 
-def test_limit_discontinuities_find_clear_purge_boundaries():
+def test_plateau_edges_are_second_transition_after_minimum_and_before_fall():
     time = np.arange(10, dtype=float)
     thickness = np.array(
         [0.0, 1.0, 2.0, 3.0, 3.05, 3.02, 3.00, 2.0, 1.0, 0.0],
@@ -100,7 +100,31 @@ def test_limit_discontinuities_find_clear_purge_boundaries():
     assert transitions == (3, 6)
 
 
-def test_limit_check_ignores_small_internal_slope_changes():
+def test_slight_positive_or_negative_purge_drift_is_allowed():
+    time = np.arange(13, dtype=float)
+    thickness = np.array(
+        [0.0, 0.8, 1.7, 2.7, 3.0, 3.04, 3.02, 3.05, 3.01, 2.9, 2.0, 1.0, 0.0],
+        dtype=float,
+    )
+
+    transitions = _detect_plateau_transition_indices(
+        time,
+        thickness,
+        min1_idx=0,
+        max_idx=7,
+        min2_idx=12,
+        smoothing_window=3,
+        plateau_fraction=0.35,
+    )
+
+    assert transitions is not None
+    b, c = transitions
+    assert 0 < b <= 7 <= c < 12
+    assert b > 1
+    assert c >= 7
+
+
+def test_isolated_downward_excursion_during_purge_does_not_end_c():
     time = np.arange(13, dtype=float)
     thickness = np.array(
         [
@@ -134,7 +158,7 @@ def test_limit_check_ignores_small_internal_slope_changes():
     assert transitions == (3, 8)
 
 
-def test_single_strong_drop_remains_valid_limit_discontinuity():
+def test_single_strong_drop_can_define_point_c():
     time = np.arange(10, dtype=float)
     thickness = np.array(
         [0.0, 1.0, 2.0, 3.0, 3.05, 3.04, 3.03, 1.00, 1.00, 0.90],
@@ -154,7 +178,7 @@ def test_single_strong_drop_remains_valid_limit_discontinuity():
     assert transitions == (3, 6)
 
 
-def test_transition_points_are_not_assigned_to_maximum_without_resolved_purge():
+def test_maximum_can_be_b_and_c_when_no_plateau_is_resolved():
     time = np.arange(7, dtype=float)
     thickness = np.array([0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 0.0], dtype=float)
 
@@ -168,7 +192,7 @@ def test_transition_points_are_not_assigned_to_maximum_without_resolved_purge():
         plateau_fraction=0.35,
     )
 
-    assert transitions is None
+    assert transitions == (3, 3)
 
 
 def test_falling_wrapper_finds_sustained_or_instantaneous_fall_start():
@@ -188,7 +212,7 @@ def test_falling_wrapper_finds_sustained_or_instantaneous_fall_start():
     assert 0 <= transition_idx < 7
 
 
-def test_cycle_math_uses_resolved_limit_boundaries_and_stores_max_anchor():
+def test_cycle_math_uses_plateau_edges_and_stores_max_anchor():
     time = np.arange(10, dtype=float)
     thickness = np.array(
         [0.0, 1.0, 2.0, 3.0, 3.05, 3.02, 3.00, 2.0, 1.0, 0.0],
@@ -217,7 +241,6 @@ def test_cycle_math_uses_resolved_limit_boundaries_and_stores_max_anchor():
 
     assert (b, c) == (3, 6)
     assert int(row["Max Anchor Index"]) == 4
-    assert b < int(row["Max Anchor Index"]) < c
     assert row["Max Anchor Time"] == time[4]
     assert row["Max Anchor Thickness"] == thickness[4]
     assert np.isclose(row["Delta 1"], thickness[b] - thickness[0])
