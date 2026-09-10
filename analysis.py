@@ -272,20 +272,65 @@ def _effective_savgol_window(
     return window
 
 
+def _isolated_smoothed_slopes(
+    time_values: np.ndarray,
+    thickness_values: np.ndarray,
+    smoothing_window: int,
+    polyorder: int = 2,
+) -> np.ndarray:
+    """Calculate interval slopes after smoothing one side of a cycle in isolation.
+
+    The caller supplies either A->M or M->D. The Savitzky-Golay filter therefore
+    never sees samples from the opposite side of the maximum. If the side is too
+    short for the requested polynomial, raw thickness values are used so sparse
+    cycles remain analyzable rather than being rejected solely by smoothing.
+    """
+    local_time = np.asarray(time_values, dtype=float)
+    local_thickness = np.asarray(thickness_values, dtype=float)
+    if len(local_time) != len(local_thickness) or len(local_time) < 2:
+        return np.asarray([], dtype=float)
+    if not np.isfinite(local_time).all() or not np.isfinite(local_thickness).all():
+        return np.asarray([], dtype=float)
+    if np.any(np.diff(local_time) <= 0):
+        return np.asarray([], dtype=float)
+
+    effective_window = _effective_savgol_window(
+        len(local_time), smoothing_window, polyorder
+    )
+    if effective_window is None:
+        smoothed = local_thickness.copy()
+    else:
+        smoothed = signal.savgol_filter(
+            local_thickness,
+            window_length=effective_window,
+            polyorder=polyorder,
+            mode="interp",
+        )
+
+    return np.diff(smoothed) / np.diff(local_time)
+
+
 def _find_fall_onset_interval(
     slopes: np.ndarray,
     plateau_limit: float,
     fall_reference: float,
     start_idx: int = 0,
+    instantaneous_slopes: np.ndarray | None = None,
 ) -> int | None:
     """Return the first sustained or clearly instantaneous active-fall interval.
 
-    A normal fall needs two consecutive intervals below the plateau threshold.
-    A single interval can also define the onset when its magnitude reaches the
-    representative active-fall rate. To avoid accepting an obvious spike/rebound,
-    that single-drop path is rejected when the next interval rebounds upward with
-    comparable magnitude.
+    Sustained fall detection uses the smoothed slopes. The optional
+    instantaneous_slopes path uses raw interval slopes for the one-sample strong
+    drop exception, so isolated smoothing cannot erase a genuinely abrupt event.
     """
+    slopes = np.asarray(slopes, dtype=float)
+    if instantaneous_slopes is None:
+        instantaneous = slopes
+    else:
+        instantaneous = np.asarray(instantaneous_slopes, dtype=float)
+        if len(instantaneous) != len(slopes):
+            instantaneous = slopes
+
     for interval_idx in range(int(start_idx), len(slopes)):
         current_slope = float(slopes[interval_idx])
 
@@ -295,10 +340,11 @@ def _find_fall_onset_interval(
             and slopes[interval_idx + 1] < -plateau_limit
         )
 
-        exceptional_single_drop = current_slope <= -fall_reference
+        instantaneous_slope = float(instantaneous[interval_idx])
+        exceptional_single_drop = instantaneous_slope <= -fall_reference
         strong_immediate_rebound = (
-            interval_idx + 1 < len(slopes)
-            and slopes[interval_idx + 1] >= fall_reference
+            interval_idx + 1 < len(instantaneous)
+            and instantaneous[interval_idx + 1] >= fall_reference
         )
 
         if sustained_fall or (
@@ -391,8 +437,17 @@ def _find_confirmed_active_fall_start(
     start_idx: int,
     active_limit: float,
     fall_reference: float,
+    instantaneous_slopes: np.ndarray | None = None,
 ) -> int | None:
-    """Find a clearly active fall, preserving the established single-drop path."""
+    """Find a clearly active fall while preserving a raw single-drop event."""
+    slopes = np.asarray(slopes, dtype=float)
+    if instantaneous_slopes is None:
+        instantaneous = slopes
+    else:
+        instantaneous = np.asarray(instantaneous_slopes, dtype=float)
+        if len(instantaneous) != len(slopes):
+            instantaneous = slopes
+
     for interval_idx in range(int(start_idx), len(slopes)):
         current_slope = float(slopes[interval_idx])
         sustained_active_fall = (
@@ -400,10 +455,11 @@ def _find_confirmed_active_fall_start(
             and current_slope <= -active_limit
             and slopes[interval_idx + 1] <= -active_limit
         )
-        exceptional_single_drop = current_slope <= -fall_reference
+        instantaneous_slope = float(instantaneous[interval_idx])
+        exceptional_single_drop = instantaneous_slope <= -fall_reference
         strong_immediate_rebound = (
-            interval_idx + 1 < len(slopes)
-            and slopes[interval_idx + 1] >= fall_reference
+            interval_idx + 1 < len(instantaneous)
+            and instantaneous[interval_idx + 1] >= fall_reference
         )
 
         if sustained_active_fall or (
@@ -420,6 +476,7 @@ def _refine_point_c_with_transition_band(
     active_limit: float,
     fall_reference: float,
     baseline_c_idx: int,
+    instantaneous_slopes: np.ndarray | None = None,
 ) -> int:
     """Move C only outward through a sustained purge -> fall ambiguity band.
 
@@ -438,6 +495,7 @@ def _refine_point_c_with_transition_band(
         start_idx=max_local_idx,
         active_limit=active_limit,
         fall_reference=fall_reference,
+        instantaneous_slopes=instantaneous_slopes,
     )
     if active_start is None or active_start <= max_local_idx:
         return int(baseline_c_idx)
@@ -471,18 +529,14 @@ def _detect_plateau_transition_indices(
     plateau_fraction: float = 0.35,
     polyorder: int = 2,
 ) -> tuple[int, int] | None:
-    """Locate B and C using the established detector plus transition-band refinement.
+    """Locate B and C with independent A->M and M->D smoothing.
 
-    The original logic is retained as the baseline:
-      - B = left edge of the low-slope purge region after the active rise
-      - C = first sustained active fall, or one clearly instantaneous strong drop
-
-    A second, conservative layer handles multi-sample ambiguous boundaries. It
-    requires stable regimes on both sides, ignores isolated blips, and places the
-    point near the middle of the unresolved transition band. The refinement is
-    one-way: B may move earlier and C may move later, so ambiguous samples are
-    preferentially absorbed into the M/purge region rather than into Delta 1 or
-    Delta 3. If no stable transition band exists, the original B/C are unchanged.
+    Raw extrema define A, M, and D. Transition slopes are then calculated from
+    two independently smoothed traces: A->M for B and M->D for C. No smoothing
+    window is allowed to cross M. The established plateau/sustained-fall logic and
+    transition-band refinement are retained, while raw slopes preserve the
+    exceptional one-sample drop path. B=M and/or C=M remain valid when the data
+    genuinely resolve a direct transition at the maximum.
     """
     if not (0.01 <= float(plateau_fraction) <= 0.95):
         return None
@@ -503,23 +557,26 @@ def _detect_plateau_transition_indices(
     if np.any(np.diff(segment_time) <= 0):
         return None
 
-    effective_window = _effective_savgol_window(
-        len(segment_time), smoothing_window, polyorder
+    max_local_idx = max_idx - min1_idx
+    left_slopes = _isolated_smoothed_slopes(
+        segment_time[: max_local_idx + 1],
+        segment_thickness[: max_local_idx + 1],
+        smoothing_window=smoothing_window,
+        polyorder=polyorder,
     )
-    if effective_window is None:
+    right_slopes = _isolated_smoothed_slopes(
+        segment_time[max_local_idx:],
+        segment_thickness[max_local_idx:],
+        smoothing_window=smoothing_window,
+        polyorder=polyorder,
+    )
+    if len(left_slopes) != max_local_idx:
+        return None
+    if len(right_slopes) != len(segment_time) - max_local_idx - 1:
         return None
 
-    smoothed = signal.savgol_filter(
-        segment_thickness,
-        window_length=effective_window,
-        polyorder=polyorder,
-        mode="interp",
-    )
-    interval_slopes = np.diff(smoothed) / np.diff(segment_time)
-
-    max_local_idx = max_idx - min1_idx
-    left_slopes = interval_slopes[:max_local_idx]
-    right_slopes = interval_slopes[max_local_idx:]
+    interval_slopes = np.concatenate([left_slopes, right_slopes])
+    raw_interval_slopes = np.diff(segment_thickness) / np.diff(segment_time)
 
     positive_rise = left_slopes[left_slopes > 0]
     negative_fall = -right_slopes[right_slopes < 0]
@@ -552,6 +609,7 @@ def _detect_plateau_transition_indices(
         plateau_limit=fall_plateau_limit,
         fall_reference=fall_reference,
         start_idx=max_local_idx,
+        instantaneous_slopes=raw_interval_slopes,
     )
     if baseline_c_local_idx is None:
         return None
@@ -573,6 +631,7 @@ def _detect_plateau_transition_indices(
         active_limit=fall_active_limit,
         fall_reference=fall_reference,
         baseline_c_idx=baseline_c_local_idx,
+        instantaneous_slopes=raw_interval_slopes,
     )
 
     if point_b_local_idx <= 0:
@@ -606,7 +665,7 @@ def _detect_transition_index(
     polyorder: int = 2,
     min_width: float | None = None,
 ) -> int | None:
-    """Backward-compatible one-sided Point C detector after a maximum anchor."""
+    """Backward-compatible isolated Point C detector after a maximum anchor."""
     del persistence, min_width
 
     if not (max_idx < min2_idx):
@@ -619,19 +678,16 @@ def _detect_transition_index(
     if len(segment_time) < 2 or np.any(np.diff(segment_time) <= 0):
         return None
 
-    effective_window = _effective_savgol_window(
-        len(segment_time), smoothing_window, polyorder
+    slopes = _isolated_smoothed_slopes(
+        segment_time,
+        segment_thickness,
+        smoothing_window=smoothing_window,
+        polyorder=polyorder,
     )
-    if effective_window is None:
+    if len(slopes) != len(segment_time) - 1:
         return None
 
-    smoothed = signal.savgol_filter(
-        segment_thickness,
-        window_length=effective_window,
-        polyorder=polyorder,
-        mode="interp",
-    )
-    slopes = np.diff(smoothed) / np.diff(segment_time)
+    raw_slopes = np.diff(segment_thickness) / np.diff(segment_time)
     negative_fall = -slopes[slopes < 0]
     if len(negative_fall) == 0:
         return None
@@ -644,6 +700,7 @@ def _detect_transition_index(
         plateau_limit=plateau_limit,
         fall_reference=fall_reference,
         start_idx=0,
+        instantaneous_slopes=raw_slopes,
     )
     if interval_idx is None:
         return None
@@ -662,14 +719,12 @@ def calculate_cycles(
     transition_polyorder: int = 2,
     transition_min_width: float | None = None,
 ) -> CycleAnalysisResult:
-    """Calculate max-anchored cycles using purge entry B and fall-onset C.
+    """Calculate max-anchored cycles using isolated transition smoothing.
 
-    A and D are successive minima. The detected maximum anchors the purge region:
-      - B = rise -> purge transition, refined through any stable ambiguity band
-      - C = purge -> fall transition, refined through any stable ambiguity band
-
-    The established B/C detector remains the baseline, and ambiguous samples are
-    included in the M/purge region only when sustained regimes support doing so.
+    A and D are successive raw minima and M is the raw maximum anchor. B is
+    detected from independently smoothed A->M data and C from independently
+    smoothed M->D data. Existing transition-band and single-drop behavior is
+    retained; equality with M is allowed when the sampled process supports it.
     """
     del transition_persistence, transition_min_width
 
