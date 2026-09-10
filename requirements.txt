@@ -4,3 +4,4 @@ numpy
 scipy
 matplotlib
 openpyxl
+# force Community Cloud rebuild for isolated-transition smoothing deployment
