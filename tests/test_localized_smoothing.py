@@ -1,116 +1,161 @@
 import numpy as np
+import pandas as pd
 
+import analysis
 from analysis import (
-    _default_local_radius,
+    CycleAnalysisResult,
+    OUTPUT_COLUMNS,
+    _apply_localized_equality_smoothing,
     _detect_plateau_transition_indices,
-    _localized_refine_point_b,
+    _equality_masks,
 )
 
 
-def test_default_local_radius_stays_compact_relative_to_sg_window():
-    assert _default_local_radius(3) == 3
-    assert _default_local_radius(5) == 4
-    assert _default_local_radius(7) == 5
-
-
-def test_localized_refinement_ignores_data_outside_b_neighborhood():
-    time = np.arange(12, dtype=float)
-
-    # The two traces are identical around preliminary B=5 but radically different
-    # far away. Local B refinement should therefore return the same point.
-    base = np.array(
-        [0.0, 1.0, 2.0, 3.0, 3.8, 4.0, 4.05, 4.06, 4.07, 4.08, 4.09, 4.10],
-        dtype=float,
-    )
-    altered = base.copy()
-    altered[0] = -1000.0
-    altered[10] = 900.0
-    altered[11] = -900.0
-
-    kwargs = dict(
-        segment_time=time,
-        preliminary_b_idx=5,
-        max_local_idx=9,
-        local_radius=2,
-        smoothing_window=3,
-        plateau_limit=0.35,
-        active_limit=0.65,
-        polyorder=2,
-    )
-    first = _localized_refine_point_b(segment_thickness=base, **kwargs)
-    second = _localized_refine_point_b(segment_thickness=altered, **kwargs)
-
-    assert first == second
-
-
-def test_direct_triangle_still_allows_b_and_c_to_equal_maximum():
-    time = np.arange(7, dtype=float)
-    thickness = np.array([0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 0.0], dtype=float)
-
-    transitions = _detect_plateau_transition_indices(
-        time,
-        thickness,
-        min1_idx=0,
-        max_idx=3,
-        min2_idx=6,
-        smoothing_window=5,
-        plateau_fraction=0.35,
+def _result_from_row(row: dict) -> CycleAnalysisResult:
+    cycle_df = pd.DataFrame([row])
+    for column in OUTPUT_COLUMNS:
+        if column not in cycle_df.columns:
+            cycle_df[column] = np.nan
+    cycle_df = cycle_df[OUTPUT_COLUMNS]
+    return CycleAnalysisResult(
+        cycle_df=cycle_df,
+        point_b_indices=[int(row["Point B Index"])],
+        point_c_indices=[int(row["Point C Index"])],
+        recovered_point_b_indices=[],
+        recovered_point_c_indices=[],
+        rejected_sequences=0,
+        derivative_failures=0,
     )
 
-    assert transitions == (3, 3)
+
+def _row(time, thickness, a, b, m, c, d):
+    return {
+        "Cycle": 1,
+        "Point A Index": a,
+        "Point A Time": float(time[a]),
+        "Point A Thickness": float(thickness[a]),
+        "Point B Index": b,
+        "Point B Time": float(time[b]),
+        "Point B Thickness": float(thickness[b]),
+        "Max Anchor Index": m,
+        "Max Anchor Time": float(time[m]),
+        "Max Anchor Thickness": float(thickness[m]),
+        "Point C Index": c,
+        "Point C Time": float(time[c]),
+        "Point C Thickness": float(thickness[c]),
+        "Point D Index": d,
+        "Point D Time": float(time[d]),
+        "Point D Thickness": float(thickness[d]),
+        "Delta 1": float(thickness[b] - thickness[a]),
+        "Delta 2": float(thickness[b] - thickness[c]),
+        "Delta 3": float(thickness[c] - thickness[d]),
+    }
 
 
-def test_local_smoothing_does_not_let_post_max_drop_pull_b_to_maximum():
-    time = np.arange(9, dtype=float)
+def test_primary_detector_is_the_established_detector_not_a_localized_replacement():
+    assert _detect_plateau_transition_indices is analysis._base._detect_plateau_transition_indices
+
+
+def test_equality_masks_flag_only_b_equals_m_and_c_equals_m():
+    df = pd.DataFrame(
+        {
+            "Point B Index": [3, 4, 4],
+            "Max Anchor Index": [4, 4, 4],
+            "Point C Index": [5, 5, 4],
+        }
+    )
+    b_equal, c_equal = _equality_masks(df)
+    assert b_equal.tolist() == [False, True, True]
+    assert c_equal.tolist() == [False, False, True]
+
+
+def test_localized_second_pass_does_not_touch_non_equality_cycles():
+    time = np.arange(10, dtype=float)
     thickness = np.array(
-        [0.0, 1.0, 2.0, 3.0, 3.10, 3.11, -5.0, -6.0, -7.0],
-        dtype=float,
+        [0.0, 1.0, 2.0, 3.0, 3.05, 3.02, 3.00, 2.0, 1.0, 0.0]
     )
+    primary = _result_from_row(_row(time, thickness, 0, 3, 4, 6, 9))
 
-    transitions = _detect_plateau_transition_indices(
-        time,
-        thickness,
-        min1_idx=0,
-        max_idx=5,
-        min2_idx=8,
-        smoothing_window=5,
+    refined = _apply_localized_equality_smoothing(
+        primary_result=primary,
+        time_values=time,
+        thickness_values=thickness,
+        recovered_min_indices=None,
+        recovered_max_indices=None,
+        primary_smoothing_window=3,
         plateau_fraction=0.35,
+        polyorder=2,
+        local_window=7,
     )
 
-    assert transitions == (3, 5)
+    assert refined.cycle_df.equals(primary.cycle_df)
 
 
-def test_gradual_post_max_drift_can_move_c_later_without_forcing_it():
-    slopes = np.array(
-        [
-            1.0,
-            1.0,
-            1.0,
-            0.05,
-            0.02,
-            -0.02,
-            -0.02,
-            -0.20,
-            -0.20,
-            -0.20,
-            -0.25,
-            -2.00,
-            -0.50,
-            -0.50,
-            -0.10,
-        ]
+def test_localized_b_smoothing_can_separate_a_flagged_b_equals_m_case():
+    time = np.arange(10, dtype=float)
+    thickness = np.array(
+        [0.0, 1.0, 2.0, 3.0, 3.05, 3.06, 3.07, 2.0, 1.0, 0.0]
     )
-    thickness = np.cumsum(np.r_[0.0, slopes])
-    time = np.arange(len(thickness), dtype=float)
+    primary = _result_from_row(_row(time, thickness, 0, 6, 6, 6, 9))
 
-    transitions = _detect_plateau_transition_indices(
-        time,
-        thickness,
-        min1_idx=0,
-        max_idx=5,
-        min2_idx=15,
-        smoothing_window=3,
+    refined = _apply_localized_equality_smoothing(
+        primary_result=primary,
+        time_values=time,
+        thickness_values=thickness,
+        recovered_min_indices=None,
+        recovered_max_indices=None,
+        primary_smoothing_window=3,
         plateau_fraction=0.35,
+        polyorder=2,
+        local_window=3,
     )
 
-    assert transitions == (3, 9)
+    row = refined.cycle_df.iloc[0]
+    assert int(row["Point B Index"]) < int(row["Max Anchor Index"])
+    assert int(row["Point C Index"]) == int(row["Max Anchor Index"])
+
+
+def test_localized_c_smoothing_can_separate_a_flagged_c_equals_m_case():
+    time = np.arange(11, dtype=float)
+    thickness = np.array(
+        [0.0, 1.0, 2.0, 2.8, 3.0, 3.05, 3.03, 3.01, 2.0, 1.0, 0.0]
+    )
+    primary = _result_from_row(_row(time, thickness, 0, 4, 5, 5, 10))
+
+    refined = _apply_localized_equality_smoothing(
+        primary_result=primary,
+        time_values=time,
+        thickness_values=thickness,
+        recovered_min_indices=None,
+        recovered_max_indices=None,
+        primary_smoothing_window=3,
+        plateau_fraction=0.35,
+        polyorder=2,
+        local_window=3,
+    )
+
+    row = refined.cycle_df.iloc[0]
+    assert int(row["Point B Index"]) == 4
+    assert int(row["Point C Index"]) > int(row["Max Anchor Index"])
+
+
+def test_true_triangle_equality_remains_valid_under_localized_smoothing():
+    time = np.arange(7, dtype=float)
+    thickness = np.array([0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 0.0])
+    primary = _result_from_row(_row(time, thickness, 0, 3, 3, 3, 6))
+
+    refined = _apply_localized_equality_smoothing(
+        primary_result=primary,
+        time_values=time,
+        thickness_values=thickness,
+        recovered_min_indices=None,
+        recovered_max_indices=None,
+        primary_smoothing_window=3,
+        plateau_fraction=0.35,
+        polyorder=2,
+        local_window=5,
+    )
+
+    row = refined.cycle_df.iloc[0]
+    assert int(row["Point B Index"]) == 3
+    assert int(row["Point C Index"]) == 3
