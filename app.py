@@ -1278,7 +1278,7 @@ if len(cycle_df) > 0:
     st.success(
         f"{len(cycle_df)} complete cycles with purge/fall boundaries were identified. "
         f"{flagged_cycle_count} cycle(s) are quality-flagged; "
-        f"{export_cycle_count} will be included in the CSV."
+        f"{export_cycle_count} unflagged cycle(s) are used for summary averages."
     )
 else:
     st.warning(
@@ -1293,8 +1293,10 @@ if cycle_df.empty:
 else:
     st.dataframe(cycle_display_df, use_container_width=True, hide_index=True)
     st.caption(
-        "Quality-flagged cycles remain visible for inspection but are excluded from "
-        "the CSV export. Valid ordering: B ≳ C > D > A."
+        "All detected cycles remain visible and are included in the main CSV with "
+        "Quality Flag / Quality Reason columns. A second CSV contains only flagged "
+        "cycles. Summary averages use unflagged cycles only. Valid ordering: "
+        "B ≳ C > D > A."
     )
 
     st.subheader("Inspect Individual Cycle")
@@ -1380,10 +1382,22 @@ else:
         cols[1].metric("Average Δ2", f"{export_cycle_df['Delta 2'].mean():.4f}")
         cols[2].metric("Average Δ3", f"{export_cycle_df['Delta 3'].mean():.4f}")
 
-        csv = export_cycle_df.to_csv(index=False).encode("utf-8")
+        main_csv = cycle_display_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download quality-filtered delta results as CSV",
-            data=csv,
-            file_name="cycle_delta_results_quality_filtered.csv",
+            "Download all delta results with quality flags",
+            data=main_csv,
+            file_name="cycle_delta_results_with_quality_flags.csv",
             mime="text/csv",
         )
+
+        flagged_only_df = cycle_display_df.loc[
+            cycle_display_df["Quality Flag"].eq("FLAG")
+        ].copy()
+        if not flagged_only_df.empty:
+            flagged_csv = flagged_only_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download flagged cycles only",
+                data=flagged_csv,
+                file_name="cycle_delta_results_flagged_only.csv",
+                mime="text/csv",
+            )
