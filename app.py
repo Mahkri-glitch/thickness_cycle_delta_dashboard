@@ -149,6 +149,62 @@ def classify_time_order(df: pd.DataFrame, time_col: str) -> str:
     return "mixed"
 
 
+
+def apply_cycle_quality_flags(
+    cycle_df: pd.DataFrame,
+    bc_tolerance_fraction: float,
+) -> pd.DataFrame:
+    """Flag physically inconsistent cycles without removing them from inspection.
+
+    Expected thickness ordering is B approximately >= C > D > A. Small cases
+    where C is slightly above B are accepted within a tolerance expressed as a
+    fraction of that cycle's total A/B/C/D thickness span.
+    """
+    flagged = cycle_df.copy()
+    if flagged.empty:
+        flagged["Quality Flag"] = pd.Series(dtype=str)
+        flagged["Quality Reason"] = pd.Series(dtype=str)
+        return flagged
+
+    quality_flags: list[str] = []
+    quality_reasons: list[str] = []
+
+    for _, row in flagged.iterrows():
+        thickness_a = float(row["Point A Thickness"])
+        thickness_b = float(row["Point B Thickness"])
+        thickness_c = float(row["Point C Thickness"])
+        thickness_d = float(row["Point D Thickness"])
+
+        values = np.asarray(
+            [thickness_a, thickness_b, thickness_c, thickness_d],
+            dtype=float,
+        )
+        cycle_span = float(np.max(values) - np.min(values))
+        bc_tolerance = max(
+            float(bc_tolerance_fraction) * cycle_span,
+            np.finfo(float).eps,
+        )
+
+        reasons: list[str] = []
+        if thickness_b + bc_tolerance < thickness_c:
+            reasons.append("C exceeds B beyond B/C tolerance")
+        if not thickness_c > thickness_d:
+            reasons.append("C <= D")
+        if not thickness_d > thickness_a:
+            reasons.append("D <= A")
+
+        if reasons:
+            quality_flags.append("FLAG")
+            quality_reasons.append("; ".join(reasons))
+        else:
+            quality_flags.append("OK")
+            quality_reasons.append("")
+
+    flagged["Quality Flag"] = quality_flags
+    flagged["Quality Reason"] = quality_reasons
+    return flagged
+
+
 def _recovery_issue_key(issue: dict) -> str:
     return (
         f"{issue['Missing Type']}:"
@@ -767,7 +823,23 @@ plateau_percent = st.sidebar.slider(
         "positive/negative drift in the purge region."
     ),
 )
+
 transition_onset_fraction = plateau_percent / 100.0
+
+st.sidebar.header("Cycle quality filter")
+bc_tolerance_percent = st.sidebar.slider(
+    "B/C approximate-equality tolerance (% of cycle span)",
+    min_value=0.0,
+    max_value=10.0,
+    value=2.0,
+    step=0.5,
+    help=(
+        "A cycle is export-valid when B is greater than C, or C exceeds B only "
+        "within this tolerance, and C > D > A. The tolerance is calculated as "
+        "a percentage of that cycle's A/B/C/D thickness span."
+    ),
+)
+bc_tolerance_fraction = bc_tolerance_percent / 100.0
 
 # Global extrema establish the base event sequence. Local recovery never changes
 # these global orders; saved overrides are layered on afterward.
@@ -1060,6 +1132,16 @@ if (
 
 result = calculate_cycles(**calculate_kwargs)
 cycle_df = result.cycle_df
+cycle_display_df = apply_cycle_quality_flags(
+    cycle_df,
+    bc_tolerance_fraction=bc_tolerance_fraction,
+)
+if cycle_display_df.empty:
+    quality_flag_mask = pd.Series(dtype=bool)
+    export_cycle_df = cycle_df.copy()
+else:
+    quality_flag_mask = cycle_display_df["Quality Flag"].eq("FLAG")
+    export_cycle_df = cycle_df.loc[~quality_flag_mask.to_numpy()].copy()
 
 point_b_indices = getattr(result, "point_b_indices", [])
 point_c_indices = getattr(result, "point_c_indices", result.transition_indices)
@@ -1191,8 +1273,12 @@ if use_recovery:
     )
 
 if len(cycle_df) > 0:
+    flagged_cycle_count = int(quality_flag_mask.sum())
+    export_cycle_count = len(export_cycle_df)
     st.success(
-        f"{len(cycle_df)} complete cycles with purge/fall boundaries were identified."
+        f"{len(cycle_df)} complete cycles with purge/fall boundaries were identified. "
+        f"{flagged_cycle_count} cycle(s) are quality-flagged; "
+        f"{export_cycle_count} will be included in the CSV."
     )
 else:
     st.warning(
@@ -1205,7 +1291,11 @@ st.subheader("Δ1, Δ2, and Δ3 by cycle")
 if cycle_df.empty:
     st.write("No complete ALD/ALE cycles are available in the selected analysis window.")
 else:
-    st.dataframe(cycle_df, use_container_width=True, hide_index=True)
+    st.dataframe(cycle_display_df, use_container_width=True, hide_index=True)
+    st.caption(
+        "Quality-flagged cycles remain visible for inspection but are excluded from "
+        "the CSV export. Valid ordering: B ≳ C > D > A."
+    )
 
     st.subheader("Inspect Individual Cycle")
     selector_col, padding_col = st.columns([2, 1])
@@ -1279,15 +1369,21 @@ else:
     st.dataframe(point_summary, use_container_width=True, hide_index=True)
 
     st.subheader("Average Δ Values")
-    cols = st.columns(3)
-    cols[0].metric("Average Δ1", f"{cycle_df['Delta 1'].mean():.4f}")
-    cols[1].metric("Average Δ2", f"{cycle_df['Delta 2'].mean():.4f}")
-    cols[2].metric("Average Δ3", f"{cycle_df['Delta 3'].mean():.4f}")
+    if export_cycle_df.empty:
+        st.warning(
+            "All detected cycles are quality-flagged, so no export-quality averages "
+            "or CSV rows are available under the current tolerance."
+        )
+    else:
+        cols = st.columns(3)
+        cols[0].metric("Average Δ1", f"{export_cycle_df['Delta 1'].mean():.4f}")
+        cols[1].metric("Average Δ2", f"{export_cycle_df['Delta 2'].mean():.4f}")
+        cols[2].metric("Average Δ3", f"{export_cycle_df['Delta 3'].mean():.4f}")
 
-    csv = cycle_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download delta results as CSV",
-        data=csv,
-        file_name="cycle_delta_results.csv",
-        mime="text/csv",
-    )
+        csv = export_cycle_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download quality-filtered delta results as CSV",
+            data=csv,
+            file_name="cycle_delta_results_quality_filtered.csv",
+            mime="text/csv",
+        )
