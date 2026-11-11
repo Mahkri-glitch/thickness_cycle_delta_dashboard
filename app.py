@@ -1138,9 +1138,13 @@ cycle_display_df = apply_cycle_quality_flags(
 )
 if cycle_display_df.empty:
     quality_flag_mask = pd.Series(dtype=bool)
+    quality_cycle_df = cycle_display_df.copy()
+    flagged_cycle_df = cycle_display_df.copy()
     export_cycle_df = cycle_df.copy()
 else:
     quality_flag_mask = cycle_display_df["Quality Flag"].eq("FLAG")
+    quality_cycle_df = cycle_display_df.loc[~quality_flag_mask].copy()
+    flagged_cycle_df = cycle_display_df.loc[quality_flag_mask].copy()
     export_cycle_df = cycle_df.loc[~quality_flag_mask.to_numpy()].copy()
 
 point_b_indices = getattr(result, "point_b_indices", [])
@@ -1291,84 +1295,108 @@ st.subheader("Δ1, Δ2, and Δ3 by cycle")
 if cycle_df.empty:
     st.write("No complete ALD/ALE cycles are available in the selected analysis window.")
 else:
-    st.dataframe(cycle_display_df, use_container_width=True, hide_index=True)
+    cycle_view = st.radio(
+        "Cycle quality view",
+        ["Quality cycles", "Flagged cycles", "All cycles"],
+        index=0,
+        horizontal=True,
+        help=(
+            "Quality cycles satisfy B ≳ C > D > A under the selected B/C "
+            "approximate-equality tolerance. Flagged cycles are kept separately "
+            "for review."
+        ),
+    )
+
+    if cycle_view == "Quality cycles":
+        displayed_cycle_df = quality_cycle_df
+    elif cycle_view == "Flagged cycles":
+        displayed_cycle_df = flagged_cycle_df
+    else:
+        displayed_cycle_df = cycle_display_df
+
+    st.dataframe(displayed_cycle_df, use_container_width=True, hide_index=True)
     st.caption(
-        "All detected cycles remain visible and are included in the main CSV with "
-        "Quality Flag / Quality Reason columns. A second CSV contains only flagged "
-        "cycles. Summary averages use unflagged cycles only. Valid ordering: "
-        "B ≳ C > D > A."
+        f"Quality cycles: {len(quality_cycle_df)} | "
+        f"Flagged cycles: {len(flagged_cycle_df)} | "
+        f"All detected cycles: {len(cycle_display_df)}. "
+        "Quality criterion: B ≳ C > D > A."
     )
 
     st.subheader("Inspect Individual Cycle")
     selector_col, padding_col = st.columns([2, 1])
-    cycle_numbers = cycle_df["Cycle"].astype(int).tolist()
+    cycle_numbers = displayed_cycle_df["Cycle"].astype(int).tolist()
 
-    with selector_col:
-        selected_cycle_number = st.selectbox(
-            "Cycle",
-            cycle_numbers,
-            format_func=lambda value: f"Cycle {value}",
-            key="individual_cycle_selector",
+    if cycle_numbers:
+        with selector_col:
+            selected_cycle_number = st.selectbox(
+                "Cycle",
+                cycle_numbers,
+                format_func=lambda value: f"Cycle {value}",
+                key=f"individual_cycle_selector:{cycle_view}",
+            )
+        with padding_col:
+            padding_points = st.slider(
+                "Padding (samples)",
+                min_value=0,
+                max_value=50,
+                value=5,
+                step=1,
+                help="Extra samples shown before A and after D for visual context.",
+                key="individual_cycle_padding",
+            )
+
+        selected_cycle_row = cycle_df.loc[
+            cycle_df["Cycle"].astype(int) == int(selected_cycle_number)
+        ].iloc[0]
+
+        plot_selected_cycle(
+            cycle_row=selected_cycle_row,
+            time_values=time_values,
+            thickness_values=thickness_values,
+            time_col=time_col,
+            thickness_col=thickness_col,
+            padding_points=padding_points,
         )
-    with padding_col:
-        padding_points = st.slider(
-            "Padding (samples)",
-            min_value=0,
-            max_value=50,
-            value=5,
-            step=1,
-            help="Extra samples shown before A and after D for visual context.",
-            key="individual_cycle_padding",
+    else:
+        selected_cycle_row = None
+        st.info(f"No {cycle_view.lower()} are available under the current quality settings.")
+
+    if selected_cycle_row is not None:
+        point_summary = pd.DataFrame(
+            [
+                {
+                    "Point": "A",
+                    "Index": int(selected_cycle_row["Point A Index"]),
+                    "Time": float(selected_cycle_row["Point A Time"]),
+                    "Thickness": float(selected_cycle_row["Point A Thickness"]),
+                },
+                {
+                    "Point": "B",
+                    "Index": int(selected_cycle_row["Point B Index"]),
+                    "Time": float(selected_cycle_row["Point B Time"]),
+                    "Thickness": float(selected_cycle_row["Point B Thickness"]),
+                },
+                {
+                    "Point": "M (max anchor)",
+                    "Index": int(selected_cycle_row["Max Anchor Index"]),
+                    "Time": float(selected_cycle_row["Max Anchor Time"]),
+                    "Thickness": float(selected_cycle_row["Max Anchor Thickness"]),
+                },
+                {
+                    "Point": "C",
+                    "Index": int(selected_cycle_row["Point C Index"]),
+                    "Time": float(selected_cycle_row["Point C Time"]),
+                    "Thickness": float(selected_cycle_row["Point C Thickness"]),
+                },
+                {
+                    "Point": "D",
+                    "Index": int(selected_cycle_row["Point D Index"]),
+                    "Time": float(selected_cycle_row["Point D Time"]),
+                    "Thickness": float(selected_cycle_row["Point D Thickness"]),
+                },
+            ]
         )
-
-    selected_cycle_row = cycle_df.loc[
-        cycle_df["Cycle"].astype(int) == int(selected_cycle_number)
-    ].iloc[0]
-
-    plot_selected_cycle(
-        cycle_row=selected_cycle_row,
-        time_values=time_values,
-        thickness_values=thickness_values,
-        time_col=time_col,
-        thickness_col=thickness_col,
-        padding_points=padding_points,
-    )
-
-    point_summary = pd.DataFrame(
-        [
-            {
-                "Point": "A",
-                "Index": int(selected_cycle_row["Point A Index"]),
-                "Time": float(selected_cycle_row["Point A Time"]),
-                "Thickness": float(selected_cycle_row["Point A Thickness"]),
-            },
-            {
-                "Point": "B",
-                "Index": int(selected_cycle_row["Point B Index"]),
-                "Time": float(selected_cycle_row["Point B Time"]),
-                "Thickness": float(selected_cycle_row["Point B Thickness"]),
-            },
-            {
-                "Point": "M (max anchor)",
-                "Index": int(selected_cycle_row["Max Anchor Index"]),
-                "Time": float(selected_cycle_row["Max Anchor Time"]),
-                "Thickness": float(selected_cycle_row["Max Anchor Thickness"]),
-            },
-            {
-                "Point": "C",
-                "Index": int(selected_cycle_row["Point C Index"]),
-                "Time": float(selected_cycle_row["Point C Time"]),
-                "Thickness": float(selected_cycle_row["Point C Thickness"]),
-            },
-            {
-                "Point": "D",
-                "Index": int(selected_cycle_row["Point D Index"]),
-                "Time": float(selected_cycle_row["Point D Time"]),
-                "Thickness": float(selected_cycle_row["Point D Thickness"]),
-            },
-        ]
-    )
-    st.dataframe(point_summary, use_container_width=True, hide_index=True)
+        st.dataframe(point_summary, use_container_width=True, hide_index=True)
 
     st.subheader("Average Δ Values")
     if export_cycle_df.empty:
@@ -1382,22 +1410,28 @@ else:
         cols[1].metric("Average Δ2", f"{export_cycle_df['Delta 2'].mean():.4f}")
         cols[2].metric("Average Δ3", f"{export_cycle_df['Delta 3'].mean():.4f}")
 
-    main_csv = cycle_display_df.to_csv(index=False).encode("utf-8")
+    quality_csv = quality_cycle_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "Download all delta results with quality flags",
-        data=main_csv,
-        file_name="cycle_delta_results_with_quality_flags.csv",
+        "Download quality cycles only",
+        data=quality_csv,
+        file_name="cycle_delta_results_quality_only.csv",
         mime="text/csv",
+        disabled=quality_cycle_df.empty,
     )
 
-    flagged_only_df = cycle_display_df.loc[
-        cycle_display_df["Quality Flag"].eq("FLAG")
-    ].copy()
-    if not flagged_only_df.empty:
-        flagged_csv = flagged_only_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download flagged cycles only",
-            data=flagged_csv,
-            file_name="cycle_delta_results_flagged_only.csv",
-            mime="text/csv",
-        )
+    flagged_csv = flagged_cycle_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download flagged cycles only",
+        data=flagged_csv,
+        file_name="cycle_delta_results_flagged_only.csv",
+        mime="text/csv",
+        disabled=flagged_cycle_df.empty,
+    )
+
+    all_csv = cycle_display_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download all cycles with quality flags",
+        data=all_csv,
+        file_name="cycle_delta_results_all_with_quality_flags.csv",
+        mime="text/csv",
+    )
