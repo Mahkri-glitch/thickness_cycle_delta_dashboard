@@ -1373,8 +1373,8 @@ else:
     st.subheader("Average Δ Values")
     if export_cycle_df.empty:
         st.warning(
-            "All detected cycles are quality-flagged, so no export-quality averages "
-            "or CSV rows are available under the current tolerance."
+            "All detected cycles are quality-flagged, so no unflagged-cycle "
+            "averages are available under the current tolerance."
         )
     else:
         cols = st.columns(3)
@@ -1382,22 +1382,22 @@ else:
         cols[1].metric("Average Δ2", f"{export_cycle_df['Delta 2'].mean():.4f}")
         cols[2].metric("Average Δ3", f"{export_cycle_df['Delta 3'].mean():.4f}")
 
-        main_csv = cycle_display_df.to_csv(index=False).encode("utf-8")
+    main_csv = cycle_display_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download all delta results with quality flags",
+        data=main_csv,
+        file_name="cycle_delta_results_with_quality_flags.csv",
+        mime="text/csv",
+    )
+
+    flagged_only_df = cycle_display_df.loc[
+        cycle_display_df["Quality Flag"].eq("FLAG")
+    ].copy()
+    if not flagged_only_df.empty:
+        flagged_csv = flagged_only_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download all delta results with quality flags",
-            data=main_csv,
-            file_name="cycle_delta_results_with_quality_flags.csv",
+            "Download flagged cycles only",
+            data=flagged_csv,
+            file_name="cycle_delta_results_flagged_only.csv",
             mime="text/csv",
         )
-
-        flagged_only_df = cycle_display_df.loc[
-            cycle_display_df["Quality Flag"].eq("FLAG")
-        ].copy()
-        if not flagged_only_df.empty:
-            flagged_csv = flagged_only_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download flagged cycles only",
-                data=flagged_csv,
-                file_name="cycle_delta_results_flagged_only.csv",
-                mime="text/csv",
-            )
